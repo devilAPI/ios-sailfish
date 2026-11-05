@@ -57,10 +57,19 @@ branch `axon7`). The iOS root uses `tools/mkiosroot.sh` (needs apfs-fuse, hfspro
 Boot-args for first tests (`tools/axon7-cycle.sh`): `sweetclk=0` keeps LK's
 CPU clocks, `sweetcharge=0` leaves the charger alone.
 
+## To do
+
+- **Wi-Fi**: QCA6174 on PCIe RC0, wired like the Pixel's (same PERST/bootstrap/wlan_en GPIOs and rails, plus the L18 antenna switch). Pass `sailfishwlan=1` and the WLAN blobs (`otp30.bin`, `qwlan30.bin`, `bdwlan30.bin` + the board file matching the OTP board id among `.b01`-`.b1c`).
+- **Power off / restart**: shutdown ends in "halt restart timed out" (no platform halt); add PSCI SYSTEM_OFF / SYSTEM_RESET, and a UFS SYNCHRONIZE CACHE before them (the HFS unmount at shutdown did not reach the disk).
+- **Brightness**: the DCS 0x51 write over DSI0 never completes on the split-DSI panel ("panel level ... FAILED"); likely needs the broadcast setup of both DSI controllers.
+- **Capacitive keys**: Back/Home/Menu under the screen (downstream `gen-vkeys` / `cap-button-codes`); the RMI4 scan finds only F01/F12/F34, so they are probably virtual keys below the 2560-pixel area. Map the Home key.
+- **Battery**: `SWEET BATTERY: PMIC read failed at step 1` at boot (PMI8996 fuel gauge differs from the Pixel's PMI8994); charging via the external SMB1351 is untouched (`sweetcharge=0`).
+- **Performance**: raise CPU clocks (820 speed bins vs the Pixel's 821 tables), DDR 1804 MHz, GPU 400/600 MHz; tame the first-boot widget-extension storm.
+
 ## Milestones
 
 1. ~~Probe shim: entry state, LK's split-DSI MDP setup, a working pstore zone, reset to recovery.~~ Done.
 2. ~~Loader shim + kernel with an Axon 7 ADT: XNU early boot log in pstore.~~ Done (panic in libfirehose, fixed).
-3. Kernel: pstore, framebuffer (split DSI), UFS root -> launchd.
-4. Touch, keys, battery -> SpringBoard usable.
-5. GPU (sweetgl), Wi-Fi.
+3. ~~Kernel: pstore, framebuffer (split DSI), UFS root -> launchd.~~ Done.
+4. ~~Touch, keys -> SpringBoard usable.~~ Done: lock screen, unlock with Volume Down (Home), touch works. Battery open.
+5. GPU (sweetgl): ~~running~~ (Mesa freedreno, GPU present; sweetgl built by `.github/workflows/sweetgl.yml`). Performance and Wi-Fi open.
