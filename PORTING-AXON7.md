@@ -1,11 +1,21 @@
 # Port to the ZTE Axon 7 (A2017G, `ailsa_ii`)
 
-Status (2026-11-05): **XNU boots on the Axon 7.** The loader shim starts the
-CI-built kernel, which runs through MMU setup, pmap, VM bootstrap, the zone
-allocator and the kernel console on the full 1440x2560 screen. The first
-boot panicked at 4.9 s on an ARMv8.1 atomic (`LDADD`) in libfirehose, which
-the CI workflow had built without `-mcpu=kryo`; fixed in `.github/workflows/xnu.yml`.
-No iOS root yet.
+Status (2026-11-05): **iOS 16.7.16 boots to the lock screen and home screen
+on the Axon 7, GPU-accelerated, unlocks with Volume Down (Home), touch works,
+rootless jailbreak with Sileo pre-installed.** Wi-Fi scans but does not
+finish the WPA2 handshake yet (see To do).
+
+| Area | State on the Axon 7 |
+| --- | --- |
+| Boot | ZTE LK -> shim (boot partition, written from TWRP; no `fastboot boot`) -> XNU, ~10 s to launchd |
+| Display | split-DSI panel driven as one 1440x2560 surface, GPU scaling from the iPhone 8 750x1334 canvas |
+| GPU | Adreno 530 via Mesa freedreno (`sweetgl.dylib`, built by `.github/workflows/sweetgl.yml`), 400 MHz default (600 tested, warm) |
+| Clocks | DDR 1804 MHz, CPU 1228/1363 MHz (`sweetddr=1804`, `sweetclk` on) |
+| Storage | iOS root = journaled HFS+ in `userdata`, read-write |
+| Touch / keys | Synaptics RMI4 F12 (1439x2559, IRQ), Power, Volume Up, Volume Down = Home |
+| Wi-Fi | QCA6174 up, scans, auth + assoc OK; EAPOL 4/4 does not complete with the phone's own firmware (HTT 3.28) |
+| Jailbreak | Procursus rootless bootstrap (`/var/jb`, CF 1900) + Sileo 2.5.1, set up on first boot by a launchd job |
+| Shutdown | power off / restart through PSCI with PMIC PS_HOLD config (patch 0190) |
 
 Hardware reference for the phone: https://github.com/devilAPI/zte-axon7 (`docs/`).
 
@@ -53,14 +63,46 @@ branch `axon7`). The iOS root uses `tools/mkiosroot.sh` (needs apfs-fuse, hfspro
 | 0186 | GPU panel buffers 16 MiB at 0xc1000000 / 0xc2000000 |
 | 0187 | touch on BLSP2 QUP6, rails L14/L22, 1440x2560 |
 | 0188 | volume keys on PM8994 GPIO 2/3 |
+| 0189 | Wi-Fi: answer a repeated EAPOL 3/4 before installing keys |
+| 0190 | power off / restart: UFS cache flush, PM8994 PS_HOLD type, PSCI SYSTEM_OFF/RESET |
+| 0191 | Wi-Fi: EAPOL 4/4 resent on the management path when the data path stalls (testing) |
 
-Boot-args for first tests (`tools/axon7-cycle.sh`): `sweetclk=0` keeps LK's
-CPU clocks, `sweetcharge=0` leaves the charger alone.
+Boot-args in use (`research/axon7/bootargs-*.txt`, 418 of 608 bytes):
+
+```
+debug=0xc serial=3 cpus=4 keepsyms=1 -noprogress sweetusb=0 rd=ufsroot0
+unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1
+rootrw=1 launchd_unsecure_cache=1 wdt=-1 cs_enforcement_disable=1
+sweetnull=backboardd sweetcharge=0 sweetprof=- sweetsample=- sweetfb_noconsole=1
+sweetgpu=8 sweetenv=backboardd:DYLD_INSERT_LIBRARIES=/usr/lib/sweetgl.dylib
+sweetddr=1804 sweetgpuclk=400 sailfishwlan=1
+```
+
+## Tools (Linux host)
+
+| Tool | What |
+| --- | --- |
+| `shim/build-axon7.sh` | shim with clang/lld (probe or loader) |
+| `tools/axon7-cycle.sh KERNEL NAME ARGS` | ADT + payload (GPU and Wi-Fi blobs) + shim, write `boot` from TWRP, reboot, wait for TWRP, save pstore |
+| `tools/axon7-mkroot.sh` | iOS root image from the IPSW (`mkiosroot.sh` + `sweet-root-tweaks.py` + stock apps) |
+| `tools/axon7-flashroot.sh` | write the root to `userdata`: compressed full write, or only changed 1 MiB chunks |
+| `tools/axon7-pullroot.sh` | bring the local image up to date with the phone (4 MiB chunk hashes), `--allow-dirty` |
+| `tools/hfs-journal-replay.py` | replay an HFS+ journal like XNU (Linux fsck does not) |
+| `tools/hfs-btree-fix.py` | fix B-tree extents XNU refuses (Linux hfsplus leaves odd ones) |
+| `tools/axon7-root-add.sh` | install files into the root (sudo loop mount) |
+| `tools/axon7-jailbreak.sh` | Procursus bootstrap + Sileo + first-boot launchd job (`axon7-jbinit.sh`) |
+| `tools/sweet-log-pull.sh` | kernel log ring from the end of `userdata` |
+
+Root editing cycle: `axon7-pullroot.sh` (phone in TWRP) -> edit with
+`axon7-root-add.sh` / `axon7-jailbreak.sh` -> `axon7-flashroot.sh` (delta, seconds).
+Shut iOS down with "slide to power off" when possible; after a forced reset
+pull with `--allow-dirty` and replay the journal first.
 
 ## To do
 
-- **Wi-Fi**: QCA6174 on PCIe RC0, wired like the Pixel's (same PERST/bootstrap/wlan_en GPIOs and rails, plus the L18 antenna switch). Pass `sailfishwlan=1` and the WLAN blobs (`otp30.bin`, `qwlan30.bin`, `bdwlan30.bin` + the board file matching the OTP board id among `.b01`-`.b1c`).
-- **Power off / restart**: shutdown ends in "halt restart timed out" (no platform halt); add PSCI SYSTEM_OFF / SYSTEM_RESET, and a UFS SYNCHRONIZE CACHE before them (the HFS unmount at shutdown did not reach the disk).
+- **Wi-Fi**: works up to the 4-way handshake: firmware (own `qwlan30.bin`, HTT 3.28, OTP board id 0 -> `bdwlan30.bin`), PCIe INTA (SPI 244), scan, auth, assoc, EAPOL 1/4 -> 2/4, 3/4 received. Our 4/4 never gets a tx completion on the data path and the AP repeats 3/4 (patches 0189, 0191). If the management-path 4/4 does not help: compare HTT tx descriptors for 3.28 vs 3.50, or a newer Rome firmware.
+- **Dual boot with postmarketOS**: pmOS rootfs on microSD; a shim boot menu (volume key) to start either XNU or Linux.
+- **Dynamic GPU clock**: 600 MHz only while animating (600 fixed runs warm; the driver has 300/400/600 only, 510/560 need mmpll9).
 - **Brightness**: the DCS 0x51 write over DSI0 never completes on the split-DSI panel ("panel level ... FAILED"); likely needs the broadcast setup of both DSI controllers.
 - **Capacitive keys**: Back/Home/Menu under the screen (downstream `gen-vkeys` / `cap-button-codes`); the RMI4 scan finds only F01/F12/F34, so they are probably virtual keys below the 2560-pixel area. Map the Home key.
 - **Battery**: `SWEET BATTERY: PMIC read failed at step 1` at boot (PMI8996 fuel gauge differs from the Pixel's PMI8994); charging via the external SMB1351 is untouched (`sweetcharge=0`).
