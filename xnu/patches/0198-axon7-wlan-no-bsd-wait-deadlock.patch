@@ -1,0 +1,32 @@
+diff --git a/iokit/Kernel/arm/SailfishWLAN.cpp b/iokit/Kernel/arm/SailfishWLAN.cpp
+index 18a32de..8575fd2 100644
+--- a/iokit/Kernel/arm/SailfishWLAN.cpp
++++ b/iokit/Kernel/arm/SailfishWLAN.cpp
+@@ -99,6 +99,7 @@ public:
+ 	IOReturn enable(IONetworkInterface *netif) APPLE_KEXT_OVERRIDE;
+ 	IOReturn disable(IONetworkInterface *netif) APPLE_KEXT_OVERRIDE;
+ 	IOReturn getHardwareAddress(IOEthernetAddress *addr) APPLE_KEXT_OVERRIDE;
++	UInt32 getFeatures(void) const APPLE_KEXT_OVERRIDE;
+ 	UInt32 outputPacket(mbuf_t m, void *param) APPLE_KEXT_OVERRIDE;
+ 	IOReturn setMulticastMode(bool active) APPLE_KEXT_OVERRIDE;
+ 	IOReturn setMulticastList(IOEthernetAddress *addrs, UInt32 count) APPLE_KEXT_OVERRIDE;
+@@ -181,6 +182,19 @@ SailfishWLAN::getHardwareAddress(IOEthernetAddress *addr)
+ 	return kIOReturnSuccess;
+ }
+ 
++/*
++ * We match on IOResources with IOResourceMatch IOBSD, so BSD is up when
++ * start() runs. IONetworkController::start would otherwise wait for the
++ * IOBSD resource again, from inside the IOResources matching pass that is
++ * starting us: a deadlock whenever that pass is still running (the Xcode 16
++ * kernel, w10: no Wi-Fi at all and root mount's 30 s "!BSD" timeout).
++ */
++UInt32
++SailfishWLAN::getFeatures(void) const
++{
++	return super::getFeatures() | kIONetworkFeatureNoBSDWait;
++}
++
+ UInt32
+ SailfishWLAN::outputPacket(mbuf_t m, void *param __unused)
+ {
