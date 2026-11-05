@@ -22,6 +22,9 @@ dev=/dev/block/bootdevice/by-name/userdata
 [[ "$(adb get-state 2>/dev/null)" == recovery ]] || { echo "phone is not in TWRP" >&2; exit 1; }
 adb shell 'umount /sdcard 2>/dev/null; umount /data 2>/dev/null; umount /data 2>/dev/null; ! mount | grep -q " /data "' ||
 	{ echo "could not unmount /data in TWRP" >&2; exit 1; }
+# XNU refuses B-trees whose extents are not whole nodes (Linux hfsplus leaves
+# those after big writes): fix or refuse before anything goes to the phone
+python3 -I tools/hfs-btree-fix.py "$img" --fix || { echo "$img: B-tree layout XNU would refuse; not writing" >&2; exit 1; }
 size=$(stat -c %s "$img")
 part=$(adb shell "blockdev --getsize64 $dev" | tr -d '\r')
 (( size <= part )) || { echo "$img ($size) is larger than userdata ($part)" >&2; exit 1; }
