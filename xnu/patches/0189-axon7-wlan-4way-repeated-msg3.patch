@@ -1,0 +1,36 @@
+diff --git a/bsd/dev/sailfish_wlan.c b/bsd/dev/sailfish_wlan.c
+index c279a3f..47620f2 100644
+--- a/bsd/dev/sailfish_wlan.c
++++ b/bsd/dev/sailfish_wlan.c
+@@ -2578,6 +2578,7 @@ wl_4way(void)
+ 	static uint8_t e[512], r[EK_DATA + sizeof(wl_rsn)], kd[256];
+ 	uint8_t pmk[32], *ptk = wl_ptk, snonce[32], anonce[32], gtk[16], gtk_id = 0, rsc[8];
+ 	bool have_ptk = false, done = false;
++	unsigned repeats = 0;
+ 	if (wl_use_pmk) {
+ 		memcpy(pmk, wl_pmk_given, sizeof(pmk));
+ 	} else {
+@@ -2652,9 +2653,22 @@ wl_4way(void)
+ 			memcpy(r + EK_REPLAY, e + EK_REPLAY, 8);
+ 			wl_hmac_sha1(ptk, 16, r, rl, NULL, 0, mic);
+ 			memcpy(r + EK_MIC, mic, 16);
+-			bool sent = wl_data_tx(wl_bss.bssid, 0x888e, r, rl) && wl_tx_wait(1000);
++			bool sent = wl_data_tx(wl_bss.bssid, 0x888e, r, rl) && wl_tx_wait(2000);
+ 			printf("SAILFISH WLAN: EAPOL 3/4 (info %#x, GTK %s id %u) -> 4/4 %s (tx status %u)\n", info, gtk_ok ? "ok" : "MISSING",
+ 			    gtk_id, sent ? "sent" : "SEND FAILED", wl_txc_status);
++			/*
++			 * Axon 7: with all CPUs busy the 4/4 can go out after the AP's
++			 * retry timer; the AP then repeats 3/4 with a higher replay
++			 * counter and ignores the late 4/4. If a newer 3/4 is already
++			 * queued, answer that one before installing keys (keys
++			 * installed first would encrypt the next 4/4, and the repeated
++			 * 3/4 would be taken for a PTK rekey once connected).
++			 */
++			if (wl_eapol_len && repeats < 3) {
++				repeats++;
++				printf("SAILFISH WLAN: AP repeated 3/4 while 4/4 was out: answering the newer one (%u)\n", repeats);
++				continue;
++			}
+ 			done = gtk_ok && wl_install_key(0, 0, ptk + 32, NULL) && wl_install_key(gtk_id, 1, gtk, rsc);
+ 			if (!done) {
+ 				break;
