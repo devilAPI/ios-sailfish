@@ -20,6 +20,15 @@ fw=research/firmware
 blobs=()
 [ -f $fw/gpu/a530_pm4.fw ] && blobs+=(--blob GPU-PM4="$out/pm4.bin" --blob GPU-PFP="$out/pfp.bin"
 	--blob GPU-ZAP-MDT=$fw/gpu/a530_zap.mdt --blob GPU-ZAP-SEG=$fw/gpu/a530_zap.b02)
+# Wi-Fi (sailfish_wlan.c, boot-arg sailfishwlan=1): firmware, OTP and every
+# board file; the chip's OTP board id picks WLAN-BDF-<id>, else WLAN-BDF
+w=$fw/wlan
+if [ -f $w/qwlan30.bin ]; then
+	blobs+=(--blob WLAN-OTP=$w/otp30.bin --blob WLAN-FW=$w/qwlan30.bin --blob WLAN-BDF=$w/bdwlan30.bin)
+	for b in $w/bdwlan30.b[0-9a-f][0-9a-f]; do
+		[ -f "$b" ] && blobs+=(--blob "WLAN-BDF-${b##*.b}=$b")
+	done
+fi
 # the kernel wants the microcode without its 4-byte header
 tail -c +5 $fw/gpu/a530_pm4.fw > "$out/pm4.bin"
 tail -c +5 $fw/gpu/a530_pfp.fw > "$out/pfp.bin"
