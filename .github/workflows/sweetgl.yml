@@ -9,7 +9,7 @@ name: sweetgl
 on:
   workflow_dispatch:
   push:
-    branches: [main]
+    branches: [main, axon7]
     paths:
       - "tools/sweetgl/**"
       - ".github/workflows/sweetgl.yml"
