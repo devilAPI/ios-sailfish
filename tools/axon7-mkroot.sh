@@ -8,9 +8,12 @@
 # The wallpaper HEIC -> PNG step (tools/wallpaper-heic2png.sh) needs macOS
 # `sips` and is skipped: the stock wallpapers then show only their gradient.
 #
-# Usage: tools/axon7-mkroot.sh [OUT.img] [SIZE]   (default research/axon7/ios16-root.img, 16G)
+# Usage: tools/axon7-mkroot.sh [--post] [OUT.img] [SIZE]   (default research/axon7/ios16-root.img, 16G)
+#   --post: the image already exists (mkiosroot.sh done): only steps 2 and 3
 set -euo pipefail
 cd "$(dirname "$0")/.."
+post=0
+[[ ${1:-} == --post ]] && { post=1; shift; }
 ipsw=research/ipsw-8
 out=${1:-research/axon7/ios16-root.img}
 size=${2:-16G}
@@ -20,10 +23,14 @@ appos=$ipsw/087-86715-047.dmg   # Cryptex1,AppOS
 for f in "$os" "$sysos" "$appos"; do
 	[[ -f $f ]] || { echo "missing $f (BuildManifest roles: OS, Cryptex1,SystemOS, Cryptex1,AppOS)" >&2; exit 1; }
 done
-[[ ! -e $out ]] || { echo "refusing to overwrite $out" >&2; exit 1; }
 sudo -v
-
-tools/mkiosroot.sh "$os" "$sysos" "$appos" "$out" "$size"
+if [[ $post == 1 ]]; then
+	[[ -f $out ]] || { echo "--post: $out does not exist" >&2; exit 1; }
+	fsck.hfsplus -f -y "$out" >/dev/null || true
+else
+	[[ ! -e $out ]] || { echo "refusing to overwrite $out (use --post to finish an existing image)" >&2; exit 1; }
+	tools/mkiosroot.sh "$os" "$sysos" "$appos" "$out" "$size"
+fi
 
 mnt=$(mktemp -d)
 cleanup() { mountpoint -q "$mnt" && sudo umount "$mnt"; rmdir "$mnt" 2>/dev/null || true; }
@@ -50,5 +57,6 @@ fi
 df -h "$mnt"
 sudo umount "$mnt"
 fsck.hfsplus -f -y "$out" | grep -v 'Illegal name' || true
+fsck.hfsplus -f -y "$out" >/dev/null || true    # see mkiosroot.sh
 fsck.hfsplus -f -n "$out"
 echo "done: $out"
