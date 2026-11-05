@@ -1,8 +1,8 @@
 diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
-index fce5fb7..7fce895 100644
+index fce5fb7..01a6658 100644
 --- a/pexpert/arm/pe_serial.c
 +++ b/pexpert/arm/pe_serial.c
-@@ -772,8 +772,20 @@ fbcon_newline(void)
+@@ -772,8 +772,22 @@ fbcon_newline(void)
   * waits for it.
   */
  #define FBCON_PP0_DONE  (1u << 8)
@@ -14,7 +14,9 @@ index fce5fb7..7fce895 100644
 + * "split-kickoff-reg" = CTL1 START. The bootloader runs two CTL paths over
 + * one buffer, CTL0 -> LM0 -> PP0 -> INTF1/DSI0 with VIG0 on the left half
 + * and CTL1 -> LM1 -> PP1 -> INTF2/DSI1 with VIG1 (SRC_XY x = width / 2) on
-+ * the right half. Every frame starts both and waits for both PP done bits.
++ * the right half. CTL1 gets its own FLUSH (VIG1, LM1); the START on CTL0
++ * alone sends both halves (MDP split display, as the shim and the first
++ * Axon 7 boot showed), and a frame is done when both PP done bits are set.
 + */
 +static volatile uint32_t *fbcon_kickoff1;       /* CTL1 START, NULL if not split */
 +static volatile uint32_t *fbcon_vig1;           /* MDP VIG1 pipe */
@@ -23,7 +25,7 @@ index fce5fb7..7fce895 100644
  static uint64_t fbcon_src_next;
  static uint32_t fbcon_src_stride;
  uint64_t sweet_fbcon_stat_kicks, sweet_fbcon_stat_done, sweet_fbcon_stat_timeout;
-@@ -790,7 +802,7 @@ fbcon_frame_done(uint64_t now)
+@@ -790,7 +804,7 @@ fbcon_frame_done(uint64_t now)
  	if (!fbcon_kick_pending) {
  		return true;
  	}
@@ -32,7 +34,7 @@ index fce5fb7..7fce895 100644
  		sweet_fbcon_stat_done++;
  		return true;
  	}
-@@ -811,11 +823,27 @@ fbcon_try_kick(void)
+@@ -811,11 +825,27 @@ fbcon_try_kick(void)
  	bool ok = fbcon_frame_done(now);
  	if (ok) {
  		if (fbcon_intr != NULL) {
@@ -62,17 +64,7 @@ index fce5fb7..7fce895 100644
  		if (src != 0 && fbcon_vig0 != NULL) {
  			fbcon_vig0[0x14 / 4] = (uint32_t)src;           /* SRC0_ADDR */
  			fbcon_vig0[0x24 / 4] = fbcon_src_stride;        /* SRC_YSTRIDE0 */
-@@ -832,6 +860,9 @@ fbcon_try_kick(void)
- 			fbcon_kickoff[-1] = flush;                      /* CTL0_FLUSH */
- 		}
- 		__builtin_arm_dsb(DSB_SY);
-+		if (fbcon_kickoff1 != NULL) {
-+			*fbcon_kickoff1 = 1;                            /* slave half first */
-+		}
- 		*fbcon_kickoff = 1;
- 		fbcon_kick_last = now;
- 		fbcon_kick_pending = true;
-@@ -918,7 +949,7 @@ sweet_fbcon_flip(uint64_t pa, uint32_t stride)
+@@ -918,7 +948,7 @@ sweet_fbcon_flip(uint64_t pa, uint32_t stride)
  void
  sweet_fbcon_blank(bool blank)
  {
@@ -81,7 +73,7 @@ index fce5fb7..7fce895 100644
  
  	if (fbcon_kickoff == NULL) {
  		return;
-@@ -929,10 +960,14 @@ sweet_fbcon_blank(bool blank)
+@@ -929,10 +959,14 @@ sweet_fbcon_blank(bool blank)
  			return;
  		}
  		shown = cur;
@@ -96,7 +88,7 @@ index fce5fb7..7fce895 100644
  	sweet_fbcon_kick(true);
  }
  
-@@ -1068,6 +1103,18 @@ fbcon_probe(void)
+@@ -1068,6 +1102,18 @@ fbcon_probe(void)
  		if (page != 0) {
  			fbcon_intr = (volatile uint32_t *)(page + (intr & PAGE_MASK));
  		}
