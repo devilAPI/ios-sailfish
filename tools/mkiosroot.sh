@@ -65,7 +65,30 @@ mounts=("$work/root" "${mounts[@]}")
 copy() {
 	echo "copying $1 -> ${2#"$work/root"}"
 	sudo mkdir -p "$2"
-	sudo rsync -aH --numeric-ids "$1/" "$2/"
+	# Newer rsync + glibc try lchmod() on symlinks, which Linux refuses with
+	# EOPNOTSUPP ("failed to set permissions on ...: Operation not supported");
+	# rsync then exits 23. Symlink modes mean nothing here, so accept exit 23
+	# when every error is exactly that, on a symlink in the destination.
+	local log rc=0
+	log=$(mktemp)
+	sudo rsync -aH --numeric-ids "$1/" "$2/" 2>"$log" || rc=$?
+	grep -v 'failed to set permissions on' "$log" >&2 || true
+	if [[ $rc == 23 ]]; then
+		local bad=0 line p
+		while IFS= read -r line; do
+			if [[ $line =~ ^rsync:\ \[[a-z]+\]\ failed\ to\ set\ permissions\ on\ \"(.*)\":\ Operation\ not\ supported ]]; then
+				p=${BASH_REMATCH[1]}
+				sudo test -L "$p" || { echo "not a symlink: $p" >&2; bad=1; }
+			elif [[ $line == "rsync error: some files/attrs were not transferred"* || -z $line ]]; then
+				:
+			else
+				bad=1
+			fi
+		done < "$log"
+		[[ $bad == 0 ]] && rc=0 && echo "(symlink permission warnings ignored)"
+	fi
+	rm -f "$log"
+	return $rc
 }
 copy "$work/os/root" "$work/root"
 copy "$work/sysos/root" "$work/root/private/preboot/Cryptexes/OS"
