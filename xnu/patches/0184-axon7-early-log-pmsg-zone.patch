@@ -1,0 +1,25 @@
+diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
+index 5d2856f..00228d8 100644
+--- a/pexpert/pexpert/arm64/SWEET.h
++++ b/pexpert/pexpert/arm64/SWEET.h
+@@ -37,11 +37,16 @@
+ #define __ARM_16K_PG__            1
+ 
+ /*
+- * Early boot log (osfmk/arm64/sweet_early.c): the Pixel 1 ramoops console
+- * zone and the 32MB block start.s / arm_vm_init map around it.
++ * Early boot log (osfmk/arm64/sweet_early.c): a ramoops zone and the 32MB
++ * block start.s / arm_vm_init map around it.
++ * ZTE Axon 7: pstore_mem is 4 MiB at 0xbfc00000 (32K dump records, then
++ * console, ftrace and pmsg, 1 MiB each). ZTE's LK writes its own boot log
++ * into the console zone, so the kernel uses the pmsg zone (shim/pstore.c);
++ * Android/TWRP show it as /sys/fs/pstore/pmsg-ramoops-0.
++ * (Pixel 1: console zone 0x83540000 in the block at 0x82000000.)
+  */
+-#define SWEET_EARLY_LOG_BLOCK     0x82000000
+-#define SWEET_EARLY_LOG_PRZ       0x83540000
++#define SWEET_EARLY_LOG_BLOCK     0xbe000000
++#define SWEET_EARLY_LOG_PRZ       0xbff00000
+ 
+ #define HAS_GIC_V3                1
+ 
