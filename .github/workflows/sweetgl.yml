@@ -1,0 +1,99 @@
+name: sweetgl
+
+# Build tools/sweetgl/out/sweetgl.dylib (Mesa freedreno + GLES + the EAGL shim
+# for CoreAnimation) on a macOS runner: it needs Apple's iPhoneOS SDK. Runs
+# the repo's own tools/sweetgl/mesa-setup.sh and build.sh, with the research/
+# layout they expect made from the runner's Xcode, a Python venv and a Mesa
+# checkout.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "tools/sweetgl/**"
+      - ".github/workflows/sweetgl.yml"
+
+concurrency:
+  group: sweetgl-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # mesa main at the commit tools/sweetgl/mesa.patch was made against: its
+  # three patched files have exactly the patch's "index" blob hashes here
+  # (freedreno_bo.c 6eda810, freedreno/meson.build e8f01b8,
+  # freedreno_resource.c 29134ba).
+  MESA_REPO: https://gitlab.freedesktop.org/mesa/mesa.git
+  MESA_SHA: 45a949a91f098b80b999636008e9facbd5633408
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Xcode with the iPhoneOS 17.5 SDK
+        run: |
+          XC=/Applications/Xcode_15.4.app
+          [ -d "$XC" ] || XC=$(ls -d /Applications/Xcode_15*.app | sort -V | tail -1)
+          sudo xcode-select -s "$XC"
+          xcodebuild -version
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "SDK=$SDK" >> "$GITHUB_ENV"
+          echo "XC=$XC" >> "$GITHUB_ENV"
+          ls "$SDK/.."
+          mkdir -p research/xcode15
+          ln -s "$XC" research/xcode15/Xcode.app
+
+      - name: Tools (meson, mako, bison, flex, ninja)
+        run: |
+          brew install ninja bison flex coreutils
+          python3 -m venv research/tools/venv
+          research/tools/venv/bin/pip install -q meson mako pyyaml packaging
+          mkdir -p research/tools/bin
+          # build.sh needs GNU-style truncate, Homebrew's is gtruncate; keep BSD stat
+          ln -s "$(brew --prefix coreutils)/bin/gtruncate" research/tools/bin/truncate
+          for t in bison flex; do ln -s "$(brew --prefix $t)/bin/$t" research/tools/bin/$t; done
+          research/tools/bin/bison --version | head -1
+          research/tools/venv/bin/meson --version
+
+      - name: Mesa
+        run: |
+          git init -q research/mesa
+          git -C research/mesa fetch -q --depth 1 "$MESA_REPO" "$MESA_SHA"
+          git -C research/mesa checkout -q FETCH_HEAD
+          git -C research/mesa apply "$GITHUB_WORKSPACE/tools/sweetgl/mesa.patch"
+          git -C research/mesa log --oneline -1
+
+      - name: Cross file for this runner
+        run: |
+          # ios-cross.txt has the author's checkout path; research/xcode15/Xcode.app
+          # is the runner's Xcode 15.4, which ships the same iPhoneOS17.5.sdk
+          sed "s|/Volumes/SamsungSSD/ios-sailfish|$GITHUB_WORKSPACE|g" \
+              tools/sweetgl/ios-cross.txt > research/ios-cross.txt
+          cp research/ios-cross.txt tools/sweetgl/ios-cross.txt
+          for p in $(grep -o "isysroot', '[^']*'" research/ios-cross.txt | cut -d"'" -f3 | sort -u); do
+            echo "sysroot $p"; [ -d "$p" ] || { echo "missing SDK $p (runner has $SDK)"; exit 1; }
+          done
+
+      - name: Configure Mesa
+        run: sh tools/sweetgl/mesa-setup.sh
+
+      - name: Build sweetgl.dylib
+        run: sh tools/sweetgl/build.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sweetgl
+          path: |
+            tools/sweetgl/out/sweetgl.dylib
+            tools/sweetgl/out/sweetgl-unpadded.dylib
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: mesa-meson-logs
+          path: research/mesa-ios/meson-logs/
+          if-no-files-found: ignore
