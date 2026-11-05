@@ -1,0 +1,22 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 1ebf60c..0f11c7b 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -544,9 +544,14 @@ fbits(int64_t num, uint32_t den)
+  * the kernel text console (24 bpp in the old buffer) no longer shows.
+  * Boot-arg sweetfb_gpu=0 keeps the CPU copy.
+  */
+-#define SWEET_FB_GPU_PA0        0xc0800000ull
+-#define SWEET_FB_GPU_PA1        0xc1000000ull
+-#define SWEET_FB_GPU_SLOT       0x00800000ull
++/*
++ * ZTE Axon 7: a 1440x2560 B,G,R,X buffer is 14.4 MiB, so the slots are
++ * 16 MiB (0xc1000000-0xc3000000: free RAM in its live DT, above pstore at
++ * 0xbfc00000 and the splash at 0x83401000).
++ */
++#define SWEET_FB_GPU_PA0        0xc1000000ull
++#define SWEET_FB_GPU_PA1        0xc2000000ull
++#define SWEET_FB_GPU_SLOT       0x01000000ull
+ 
+ bool
+ AppleCLCD::gpuStart(void)

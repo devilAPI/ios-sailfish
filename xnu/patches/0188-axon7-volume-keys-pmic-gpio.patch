@@ -1,0 +1,80 @@
+diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+index 0c548d1..221d4a0 100644
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -1,4 +1,10 @@
+ /*
++ * ZTE Axon 7 (ailsa_ii): volume up/down are PM8994 GPIO 2/3 (live DT
++ * gpio_keys, active low), read as the GPIO peripheral's RT_STS (+0x10 bit 0,
++ * mainline pinctrl-spmi-gpio) through the observer channel; SID 0 GPIO n is
++ * peripheral 0xc0 + n - 1. Power is the PON as on the Pixel. The bootloader
++ * scans these keys itself, so they are left as it configured them.
++ *
+  * Minimal polled keys for the Pixel 1 (sailfish, MSM8996). Call once after
+  * the scheduler is running. Every 20 ms:
+  *   power        PM8994 (SID 0) PON RT_STS 0x810 bit 0 (KPDPWR), read through
+@@ -37,12 +43,15 @@ bool sweet_pmic_write(uint16_t ppid, uint8_t addr, uint8_t val);
+ #define KEYS_NO_APID     0xffffu
+ /* pinctrl@1010000, one 4 KiB tile per GPIO: CFG +0, IN_OUT +4 */
+ #define KEYS_TLMM_PA     0x01010000u
+-#define KEYS_GPIO_VOLUP  126u
++#define KEYS_GPIO_VOLUP  126u   /* Pixel 1 TLMM; unused on the Axon 7 */
+ #define KEYS_GPIO_VOLDN  121u
++#define KEYS_PMIC_VOLUP  0x0c1u  /* Axon 7: PM8994 GPIO 2 */
++#define KEYS_PMIC_VOLDN  0x0c2u  /* Axon 7: PM8994 GPIO 3 */
++#define KEYS_PMIC_RT_STS 0x10u
+ 
+ enum { KEY_POWER = 0, KEY_VOLUP = 1, KEY_HOME = 3 };
+ 
+-static vm_offset_t keys_core, keys_obs, keys_cnfg, keys_volup, keys_voldn;
++static vm_offset_t keys_core, keys_obs, keys_cnfg;
+ static uint16_t keys_pon_apid = KEYS_NO_APID;
+ static uint32_t keys_version, keys_last_status;
+ static bool keys_started;
+@@ -237,12 +246,17 @@ keys_thread(void *arg, wait_result_t result)
+ 	(void)arg;
+ 	(void)result;
+ 	for (;;) {
+-		uint8_t pon = 0;
++		uint8_t pon = 0, up = 1, dn = 1;
+ 		bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
++		bool vok = sweet_pmic_read(KEYS_PMIC_VOLUP, KEYS_PMIC_RT_STS, &up) &&
++		    sweet_pmic_read(KEYS_PMIC_VOLDN, KEYS_PMIC_RT_STS, &dn);
++		if (!vok) {
++			up = dn = 1;    /* unreadable: released */
++		}
+ 		int now[3] = {
+ 			!!(pon & 1u),
+-			!(keys_rd(keys_volup, 4) & 1u),
+-			!(keys_rd(keys_voldn, 4) & 1u),
++			!(up & 1u),
++			!(dn & 1u),
+ 		};
+ 		if (!pok && keys_pon_apid != KEYS_NO_APID && (errors++ % 250u) == 0) {
+ 			printf("SWEET KEYS: PON read error arb-status=%#x\n", keys_last_status);
+@@ -274,9 +288,8 @@ sweet_keys_init(void)
+ 	}
+ 	keys_core = ml_io_map(KEYS_CORE_PA, 0x1000);
+ 	keys_cnfg = ml_io_map(KEYS_CNFG_PA, 0x1000);
+-	keys_volup = keys_gpio_map(KEYS_GPIO_VOLUP);
+-	keys_voldn = keys_gpio_map(KEYS_GPIO_VOLDN);
+-	if (!keys_core || !keys_cnfg || !keys_volup || !keys_voldn) {
++	(void)keys_gpio_map;
++	if (!keys_core || !keys_cnfg) {
+ 		printf("SWEET KEYS: MMIO mapping failed\n");
+ 		return;
+ 	}
+@@ -294,8 +307,11 @@ sweet_keys_init(void)
+ 	}
+ 	uint8_t pon = 0;
+ 	bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
+-	printf("SWEET KEYS: arb=%#x pon-apid=%u pon=%#x/%d (Home = volume down)\n",
+-	    keys_version, keys_pon_apid, pon, pok);
++	uint8_t up = 0, dn = 0;
++	bool uok = sweet_pmic_read(KEYS_PMIC_VOLUP, KEYS_PMIC_RT_STS, &up);
++	bool dok = sweet_pmic_read(KEYS_PMIC_VOLDN, KEYS_PMIC_RT_STS, &dn);
++	printf("SWEET KEYS: arb=%#x pon-apid=%u pon=%#x/%d volup=%#x/%d voldn=%#x/%d (Home = volume down)\n",
++	    keys_version, keys_pon_apid, pon, pok, up, uok, dn, dok);
+ 	if (!pok) {
+ 		printf("SWEET KEYS: power key unreadable; volume keys only\n");
+ 		keys_pon_apid = KEYS_NO_APID;

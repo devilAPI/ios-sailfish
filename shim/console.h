@@ -1,7 +1,17 @@
 #pragma once
 #include <stdint.h>
 
-#ifdef PIXEL1
+#if defined(AXON7)
+/*
+ * ZTE LK continuous splash (probe 1): one 1440x2560 RGB888 buffer, VIG0 scans
+ * the left 720 columns (CTL0 -> LM0 -> PP0 -> INTF1/DSI0), VIG1 the right
+ * ones (SRC_XY x = 720; CTL1 -> LM1 -> PP1 -> INTF2/DSI1), command mode.
+ */
+#define FB_BASE		0x83401000UL
+#define FB_W		1440
+#define FB_H		2560
+#define FB_BPP		3		/* YSTRIDE 0x10e0 */
+#elif defined(PIXEL1)
 #define FB_BASE		0xc0001000UL	/* cont_splash_mem = MDP VIG0 SRC0_ADDR */
 #define FB_W		1080
 #define FB_H		1920

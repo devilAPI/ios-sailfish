@@ -2,8 +2,9 @@
 """Build the minimal Apple Device Tree that the SWEET xnu needs to boot.
 
 Only what the early boot path actually reads (see NOTES.md); every MMIO
-address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--pixel1]
+address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--pixel1] [--axon7]
 --pixel1: Google Pixel 1 (sailfish, MSM8996) presented as an iPhone 8 instead.
+--axon7: ZTE Axon 7 (ailsa_ii, MSM8996 v3), the Pixel 1 tree with its values.
 """
 import hashlib, os, struct, sys
 
@@ -47,6 +48,21 @@ PIXEL1 = dict(
           (0x100, 1, 2150400000), (0x101, 1, 2150400000)],
 )
 
+# ZTE Axon 7 (ailsa_ii, MSM8996 v3): same SoC blocks as the Pixel 1, from its
+# live FDT and shim probe 1 (PORTING-AXON7.md). Applied over PIXEL1 by --axon7.
+AXON7 = dict(
+    mem_size=0x7e4c0000,  # upper DDR bank <0x1_00000000 0x7e4c0000>
+    # ZTE LK splash: one 1440x2560 RGB888 buffer (two VIG pipes, split DSI)
+    fb=0x83401000, fb_size=0x23ff000, fb_w=1440, fb_h=2560, fb_bpp=24,
+    fb_kickoff=0x90201c,  # CTL0 START: left half (LM0 -> PP0 -> DSI0)
+    fb_kickoff1=0x90221c,  # CTL1 START: right half (LM1 -> PP1 -> DSI1), xnu patch 0185
+    # 820: 2 x 1.59 GHz + 2 x 2.15 GHz Kryo
+    cpus=[(0x0, 0, 1593600000), (0x1, 0, 1593600000),
+          (0x100, 1, 2150400000), (0x101, 1, 2150400000)],
+)
+AXON7_IDENT = ('D20AP', 'iPhone10,1', 'D20', 'zte,ailsa_ii', 'qcom,msm8996')
+
+PIXEL1_IDENT = ('D20AP', 'iPhone10,1', 'D20', 'google,sailfish', 'qcom,msm8996')
 BOOT_MANIFEST_HASH = hashlib.sha384(b'sweet boot manifest').digest()
 
 # The iOS userland is the iPhone X (iPhone10,3 / D22AP) IPSW. MobileGestalt
@@ -255,7 +271,7 @@ def build(seed=None, qemu=False, highmem=False, pixel1=False):
             ('bits-per-pixel', u32(P['fb_bpp'])),
             # write 1 here after drawing: the panel only refreshes on request
             ('kickoff-reg', u64(P['fb_kickoff'])),
-        ])
+        ] + ([('split-kickoff-reg', u64(P['fb_kickoff1']))] if 'fb_kickoff1' in P else []))
 
     # bsd/dev/sweet_ufs.c: the UFS host ABL leaves running (absolute physical reg).
     ufs = node('sweet-ufs', [
@@ -292,7 +308,7 @@ def build(seed=None, qemu=False, highmem=False, pixel1=False):
     # hw.model/hw.target (D22AP), model is hw.machine/hw.product
     # (iPhone10,3). 'xiaomi,sweet' stays for SweetPlatformExpert matching.
     # Pixel 1 keeps 'xiaomi,sweet' for the same kernel matching (one platform expert).
-    ident = (('D20AP', 'iPhone10,1', 'D20', 'google,sailfish', 'qcom,msm8996') if pixel1 else
+    ident = (PIXEL1_IDENT if pixel1 else
              ('D22AP', 'iPhone10,3', 'D22', 'xiaomi,sweet', 'qcom,sm7150'))
     compat = cstr(ident[0]) + cstr(ident[1]) + cstr('xiaomi,sweet')
     if pixel1:
@@ -310,7 +326,12 @@ def build(seed=None, qemu=False, highmem=False, pixel1=False):
 
 
 if __name__ == '__main__':
-    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, pixel1='--pixel1' in sys.argv)
+    axon7 = '--axon7' in sys.argv
+    if axon7:
+        PIXEL1.update(AXON7)
+        PIXEL1_IDENT = AXON7_IDENT
+    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv,
+                 pixel1=axon7 or '--pixel1' in sys.argv)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:

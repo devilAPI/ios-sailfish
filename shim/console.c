@@ -30,7 +30,24 @@ static void put_px(int x, int y, uint32_t c)
 
 void con_flush(void)
 {
-#ifdef PIXEL1
+#if defined(AXON7)
+	/*
+	 * Split command-mode panel, two CTL paths: START on CTL0 (left, PP0 done =
+	 * INTR bit 8) and CTL1 (right, PP1 done = bit 9), and wait for both so the
+	 * kernel's first kick never lands mid-frame.
+	 */
+	volatile uint32_t *intr = (volatile uint32_t *)0x901014UL;
+	uint64_t t0, t, f;
+	intr[1] = 3u << 8;
+	__asm__ volatile("dsb sy" ::: "memory");
+	*(volatile uint32_t *)0x90201cUL = 1;
+	*(volatile uint32_t *)0x90221cUL = 1;
+	__asm__ volatile("mrs %0, cntfrq_el0" : "=r"(f));
+	__asm__ volatile("mrs %0, cntpct_el0" : "=r"(t0));
+	do {
+		__asm__ volatile("mrs %0, cntpct_el0" : "=r"(t));
+	} while ((intr[0] & (3u << 8)) != (3u << 8) && t - t0 < f / 10);
+#elif defined(PIXEL1)
 	/*
 	 * Command-mode panel, no autorefresh: MDP CTL0 START sends one frame
 	 * (TE wait + transfer, up to ~32 ms). Clear PING_PONG_0_DONE (MDP

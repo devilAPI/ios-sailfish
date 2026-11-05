@@ -7,7 +7,16 @@
  */
 #include "pstore.h"
 
+#if defined(AXON7)
+/*
+ * Axon 7: pstore_mem 4 MiB at 0xbfc00000; ZTE's LK logs into the console
+ * zone, so use the pmsg zone (TWRP: /sys/fs/pstore/pmsg-ramoops-0).
+ * Same size limit as the kernel's sweet_early.c.
+ */
+#define PRZ_BASE	0xbff00000UL
+#else
 #define PRZ_BASE	0x83540000UL
+#endif
 #define PRZ_DATA_MAX	(0x80000UL - 12)
 #define PRZ_SIG		0x43474244U	/* "DBGC" */
 

@@ -1,0 +1,117 @@
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index fce5fb7..7fce895 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -772,8 +772,20 @@ fbcon_newline(void)
+  * waits for it.
+  */
+ #define FBCON_PP0_DONE  (1u << 8)
++#define FBCON_PP1_DONE  (1u << 9)
+ static volatile uint32_t *fbcon_intr;   /* MDP INTR_STATUS; CLEAR is the next word */
+ static volatile uint32_t *fbcon_vig0;   /* MDP VIG0 pipe (the panel's source) */
++/*
++ * Split display (ZTE Axon 7, WQHD panel on two DSI links): ADT
++ * "split-kickoff-reg" = CTL1 START. The bootloader runs two CTL paths over
++ * one buffer, CTL0 -> LM0 -> PP0 -> INTF1/DSI0 with VIG0 on the left half
++ * and CTL1 -> LM1 -> PP1 -> INTF2/DSI1 with VIG1 (SRC_XY x = width / 2) on
++ * the right half. Every frame starts both and waits for both PP done bits.
++ */
++static volatile uint32_t *fbcon_kickoff1;       /* CTL1 START, NULL if not split */
++static volatile uint32_t *fbcon_vig1;           /* MDP VIG1 pipe */
++static uint32_t fbcon_done_mask = FBCON_PP0_DONE;
++static uint32_t fbcon_layer1_next;      /* CTL1 LAYER(LM1) for the next START, 0 = keep */
+ static uint64_t fbcon_src_next;
+ static uint32_t fbcon_src_stride;
+ uint64_t sweet_fbcon_stat_kicks, sweet_fbcon_stat_done, sweet_fbcon_stat_timeout;
+@@ -790,7 +802,7 @@ fbcon_frame_done(uint64_t now)
+ 	if (!fbcon_kick_pending) {
+ 		return true;
+ 	}
+-	if (fbcon_intr != NULL && (*fbcon_intr & FBCON_PP0_DONE)) {
++	if (fbcon_intr != NULL && (*fbcon_intr & fbcon_done_mask) == fbcon_done_mask) {
+ 		sweet_fbcon_stat_done++;
+ 		return true;
+ 	}
+@@ -811,11 +823,27 @@ fbcon_try_kick(void)
+ 	bool ok = fbcon_frame_done(now);
+ 	if (ok) {
+ 		if (fbcon_intr != NULL) {
+-			fbcon_intr[1] = FBCON_PP0_DONE;
++			fbcon_intr[1] = fbcon_done_mask;
+ 		}
+ 		uint64_t src = os_atomic_xchg(&fbcon_src_next, 0ull, relaxed);
+ 		uint32_t layer = os_atomic_xchg(&fbcon_layer_next, 0u, relaxed);
+-		uint32_t flush = 0;
++		uint32_t layer1 = os_atomic_xchg(&fbcon_layer1_next, 0u, relaxed);
++		uint32_t flush = 0, flush1 = 0;
++		if (src != 0 && fbcon_vig1 != NULL) {
++			fbcon_vig1[0x14 / 4] = (uint32_t)src;           /* same buffer, SRC_XY keeps the right half */
++			fbcon_vig1[0x24 / 4] = fbcon_src_stride;
++			fbcon_vig1[0x30 / 4] = 0x000236ffu;
++			fbcon_vig1[0x34 / 4] = 0x03020001u;
++			flush1 |= 1u << 1;                              /* VIG1 */
++		}
++		if (layer1 != 0 && fbcon_kickoff1 != NULL) {
++			fbcon_kickoff1[-6] = layer1;                    /* CTL1 LAYER(LM1) */
++			flush1 |= 1u << 7 | 1u << 17;                   /* LM1, CTL */
++		}
++		if (flush1 != 0) {
++			__builtin_arm_dsb(DSB_SY);
++			fbcon_kickoff1[-1] = flush1;                    /* CTL1_FLUSH */
++		}
+ 		if (src != 0 && fbcon_vig0 != NULL) {
+ 			fbcon_vig0[0x14 / 4] = (uint32_t)src;           /* SRC0_ADDR */
+ 			fbcon_vig0[0x24 / 4] = fbcon_src_stride;        /* SRC_YSTRIDE0 */
+@@ -832,6 +860,9 @@ fbcon_try_kick(void)
+ 			fbcon_kickoff[-1] = flush;                      /* CTL0_FLUSH */
+ 		}
+ 		__builtin_arm_dsb(DSB_SY);
++		if (fbcon_kickoff1 != NULL) {
++			*fbcon_kickoff1 = 1;                            /* slave half first */
++		}
+ 		*fbcon_kickoff = 1;
+ 		fbcon_kick_last = now;
+ 		fbcon_kick_pending = true;
+@@ -918,7 +949,7 @@ sweet_fbcon_flip(uint64_t pa, uint32_t stride)
+ void
+ sweet_fbcon_blank(bool blank)
+ {
+-	static uint32_t shown;
++	static uint32_t shown, shown1;
+ 
+ 	if (fbcon_kickoff == NULL) {
+ 		return;
+@@ -929,10 +960,14 @@ sweet_fbcon_blank(bool blank)
+ 			return;
+ 		}
+ 		shown = cur;
++		shown1 = fbcon_kickoff1 != NULL ? fbcon_kickoff1[-6] : 0;
+ 	} else if (shown == 0) {
+ 		return;
+ 	}
+ 	os_atomic_store(&fbcon_layer_next, blank ? FBCON_LAYER_BORDER : shown, release);
++	if (fbcon_kickoff1 != NULL && shown1 != 0) {
++		os_atomic_store(&fbcon_layer1_next, blank ? FBCON_LAYER_BORDER : shown1, release);
++	}
+ 	sweet_fbcon_kick(true);
+ }
+ 
+@@ -1068,6 +1103,18 @@ fbcon_probe(void)
+ 		if (page != 0) {
+ 			fbcon_intr = (volatile uint32_t *)(page + (intr & PAGE_MASK));
+ 		}
++		/* Split display: CTL1 START from the ADT, VIG1 = MDP + 0x6000 */
++		uint64_t const *kick1;
++		if (SecureDTGetProperty(entry, "split-kickoff-reg", (void const **)&kick1, &size) == kSuccess && size == 8) {
++			page = ml_io_map(trunc_page_64(*kick1), PAGE_SIZE);
++			uint64_t vig1 = (*kick & ~0xffffull) + 0x7000;
++			vm_offset_t vpage = ml_io_map(trunc_page_64(vig1), PAGE_SIZE);
++			if (page != 0 && vpage != 0) {
++				fbcon_kickoff1 = (volatile uint32_t *)(page + (*kick1 & PAGE_MASK));
++				fbcon_vig1 = (volatile uint32_t *)(vpage + (vig1 & PAGE_MASK));
++				fbcon_done_mask = FBCON_PP0_DONE | FBCON_PP1_DONE;
++			}
++		}
+ 		/* DSI0 controller 0x994000 (msm8996-mdss.dtsi mdss_dsi0), for sweet_fbcon_dcs */
+ 		uint64_t dsi = (*kick & ~0xffffull) + 0x94000;
+ 		page = ml_io_map(trunc_page_64(dsi), PAGE_SIZE);
