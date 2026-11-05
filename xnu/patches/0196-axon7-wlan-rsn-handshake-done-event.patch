@@ -1,0 +1,30 @@
+diff --git a/bsd/dev/sailfish_wlan.c b/bsd/dev/sailfish_wlan.c
+index f95f961..b8a1be9 100644
+--- a/bsd/dev/sailfish_wlan.c
++++ b/bsd/dev/sailfish_wlan.c
+@@ -1567,6 +1567,7 @@ extern void sailfish_wlan_iokit_event(uint32_t code, const void *data, uint32_t
+ #define A80211_EV_LINK_CHANGED  4
+ #define A80211_EV_ASSOC_DONE    9
+ #define A80211_EV_SCAN_DONE     10
++#define A80211_EV_RSN_HANDSHAKE_DONE 20         /* APPLE80211_M_RSN_HANDSHAKE_DONE */
+ 
+ /* Native-wifi data frame (header, LLC/SNAP at o) -> Ethernet frame to the interface. */
+ static void
+@@ -3357,6 +3358,17 @@ wl_link_changed(bool up, bool involuntary)
+ 	sailfish_wlan_iokit_event(A80211_EV_SSID_CHANGED, NULL, 0);
+ 	sailfish_wlan_iokit_event(A80211_EV_BSSID_CHANGED, NULL, 0);
+ 	sailfish_wlan_iokit_event(A80211_EV_LINK_CHANGED, ev, sizeof(ev));
++	/*
++	 * Our supplicant has finished the 4-way handshake before every link
++	 * up. wifid, once its LinkUpEventAfter4way feature flag is applied
++	 * (on each radio power-on), holds the link up from configd until
++	 * the driver reports the handshake done; without this event a join
++	 * after Wi-Fi off/on, Forget or a rejoin never got DHCP. As
++	 * AirportItlwm, no payload.
++	 */
++	if (up) {
++		sailfish_wlan_iokit_event(A80211_EV_RSN_HANDSHAKE_DONE, NULL, 0);
++	}
+ }
+ 
+ /* Connection lost: link down for iOS, rejoin with backoff until it works, wifid asks for something else, or the PCIe link is gone. */
