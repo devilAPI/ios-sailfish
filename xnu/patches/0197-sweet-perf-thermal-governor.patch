@@ -1,0 +1,256 @@
+diff --git a/bsd/dev/sweet_perf.c b/bsd/dev/sweet_perf.c
+index 906e679..0fc9c95 100644
+--- a/bsd/dev/sweet_perf.c
++++ b/bsd/dev/sweet_perf.c
+@@ -32,7 +32,9 @@
+  * 2150.4, CBF 1593.6 and the pwr cluster 1593.6 MHz. CPU 0/1 run from the
+  * pwr PLL, so first its lf mux [3:2] moves to the GPLL0 aux clock (~300 MHz)
+  * while the PLL is reprogrammed, then the hf mux [1:0] to the PLL.
+- * No CPR and no thermal management: the hardware TSENS reset is the limit.
++ * No CPR. Thermal management: the governor below (0197) scales both clusters
++ * between 960 and 1824 MHz (2150 with sweetgovmax=4) by demand and the
++ * hottest TSENS sensor; the hardware TSENS reset stays the last limit.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -114,6 +116,8 @@ static const struct clk_pll clk_cbf = {"CBF", 0x08, 0x10, 0x18, 0x20, 0x24, 0x30
+  * wait for lock, then switch mux [1:0] at muxbase+muxoff from `from` to 1
+  * (the PLL's full-rate output).
+  */
++static bool clk_quiet;                  /* governor retunes: only failures are logged */
++
+ static void
+ clk_pll_start(const struct clk_pll *p, vm_offset_t b, vm_offset_t muxbase, uint32_t muxoff,
+     uint32_t from, uint32_t mhz)
+@@ -147,8 +151,10 @@ clk_pll_start(const struct clk_pll *p, vm_offset_t b, vm_offset_t muxbase, uint3
+ 	}
+ 	clk_wr(muxbase, muxoff, (mux & ~3u) | 1u);     /* glitch-free switch */
+ 	delay(5);
+-	printf("SWEET CLK: %s PLL locked after %u us, L=%u (%u.%u MHz), mux %#x -> %#x\n",
+-	    p->name, i + 50, l, l * 192 / 10, l * 192 % 10, mux, clk_rd(muxbase, muxoff));
++	if (!clk_quiet) {
++		printf("SWEET CLK: %s PLL locked after %u us, L=%u (%u.%u MHz), mux %#x -> %#x\n",
++		    p->name, i + 50, l, l * 192 / 10, l * 192 % 10, mux, clk_rd(muxbase, muxoff));
++	}
+ }
+ 
+ /*
+@@ -244,6 +250,9 @@ perf_turbo(vm_offset_t apc0, vm_offset_t apc1, vm_offset_t cbf, vm_offset_t cbfp
+ 	printf("SWEET CLK: cbf mux=%#x pll mode=%#x l=%u\n", clk_rd(cbf, 0x18), clk_rd(cbfpll, 0), clk_rd(cbfpll, 8));
+ }
+ 
++/* Set by perf_clocks when the nominal clocks are up and S11 read 905 mV: the governor may start. */
++static vm_offset_t gov_apc0, gov_apc1;
++
+ static void
+ perf_clocks(void)
+ {
+@@ -314,6 +323,10 @@ perf_clocks(void)
+ 	}
+ 	clk_pll_start(&clk_perf, apc1, apc1, CLK_MUX, 0, MIN(MAX(mhz, 300u), perfmax));
+ 	clk_dump("perfcl", apc1);
++	if (ok && r[1] == 0x09 && r[2] == 0 && r[3] == S11_VSET_NOM && (clk_rd(apc1, CLK_MUX) & 3u) == 1u) {
++		gov_apc0 = apc0;
++		gov_apc1 = apc1;
++	}
+ 	if (cbfmhz >= 300 && cbfmax != 0) {
+ 		clk_pll_start(&clk_cbf, cbfpll, cbf, 0x18, 3, MIN(cbfmhz, cbfmax));
+ 		printf("SWEET CLK: cbf mux=%#x pll mode=%#x l=%u user=%#x\n",
+@@ -321,6 +334,180 @@ perf_clocks(void)
+ 	}
+ }
+ 
++
++/*
++ * Thermal governor (patch 0197; boot-arg sweetgov=0 turns it off, then the
++ * clocks stay nominal as before). Once: S11 to 940 mV (perf_volt_up, as for
++ * turbo: safe at every step below). Then every 250 ms on its own thread:
++ *   - temperature: the hottest valid TSENS sensor (tsens-v2, TM blocks
++ *     0x4a9000 with 13 and 0x4ad000 with 8 sensors, +0xa0 + 4n: bits 0-11
++ *     signed 0.1 C, bit 21 valid), as the Wi-Fi driver reads them
++ *   - demand: a backboardd frame or a touch move in the last 2 s
++ *   - level (perf / pwr cluster MHz) below; idle -> nominal, active -> up
++ *     one step per 500 ms to the cap (sweetgovmax=N, default 3) while
++ *     below 75 C; at >= 80 C one step down per 250 ms; at >= 90 C straight
++ *     to level 0
++ * A retune parks the cluster on the GPLL0 aux clock (~300 MHz, lf mux 3)
++ * while clk_pll_start relocks its PLL (~100 us), then switches back
++ * glitch-free, as perf_pwr_start does at boot. CBF stays nominal.
++ */
++static const struct {
++	uint16_t perf, pwr;
++} gov_lv[] = {
++	{  960,  960 },         /* 0: hot */
++	{ 1363, 1228 },         /* 1: nominal (the 905 mV band, ABL's pwr rate) */
++	{ 1593, 1363 },
++	{ 1824, 1478 },         /* 3: default cap (0183: 37-41 frames/s vs 31-39) */
++	{ 2150, 1593 },         /* 4: Pro maxima (sweetgovmax=4) */
++};
++#define GOV_NOMINAL     1u
++#define GOV_N           (sizeof(gov_lv) / sizeof(gov_lv[0]))
++static int gov_sleep_chan;
++static uint32_t gov_level = GOV_NOMINAL;
++
++static int
++gov_temp(void)
++{
++	static vm_offset_t tm[2];
++	static const uint32_t pa[2] = { 0x4a9000u, 0x4ad000u }, n[2] = { 13, 8 };
++	int max = -1000;
++	for (int b = 0; b < 2; b++) {
++		if (!tm[b]) {
++			tm[b] = ml_io_map(pa[b], 0x1000);
++		}
++		for (uint32_t i = 0; tm[b] && i < n[b]; i++) {
++			uint32_t v = clk_rd(tm[b], 0xa0 + 4 * i);
++			int t = (int)(v & 0xfffu);
++			if (t & 0x800) {
++				t -= 0x1000;
++			}
++			if ((v & (1u << 21)) && t > max) {
++				max = t;
++			}
++		}
++	}
++	return max;
++}
++
++/* One cluster to mhz: park on GPLL0 aux, relock its PLL, back to the PLL. False if it stayed parked. */
++static bool
++gov_retune(const struct clk_pll *p, vm_offset_t b, uint32_t mhz)
++{
++	uint32_t mux = clk_rd(b, CLK_MUX);
++	clk_wr(b, CLK_MUX, (mux & ~0xcu) | (3u << 2));  /* lf: GPLL0 aux */
++	clk_wr(b, CLK_MUX, clk_rd(b, CLK_MUX) & ~3u);   /* hf: lf mux */
++	delay(5);
++	clk_quiet = true;
++	clk_pll_start(p, b, b, CLK_MUX, 0, mhz);
++	clk_quiet = false;
++	return (clk_rd(b, CLK_MUX) & 3u) == 1u;
++}
++
++static bool
++gov_set(uint32_t lv)
++{
++	bool ok = gov_retune(&clk_perf, gov_apc1, gov_lv[lv].perf);
++	ok = gov_retune(&clk_pwr, gov_apc0, gov_lv[lv].pwr) && ok;
++	if (!ok) {
++		printf("SWEET GOV: retune to %u/%u MHz FAILED (perf mux %#x, pwr mux %#x)\n", gov_lv[lv].perf, gov_lv[lv].pwr,
++		    clk_rd(gov_apc1, CLK_MUX), clk_rd(gov_apc0, CLK_MUX));
++	}
++	return ok;
++}
++
++/*
++ * Next level from the current one, the hottest sensor (0.1 C), demand and
++ * the cap: >= 90 C level 0; >= 80 C one step down; idle: nominal (back up
++ * from below only under 75 C); active under 75 C: one step up (when
++ * may_step_up) to the cap; 75-80 C: hold.
++ */
++static uint32_t
++gov_next(uint32_t lv, int t, bool active, uint32_t cap, bool may_step_up)
++{
++	if (t >= 900) {
++		return 0;
++	}
++	if (t >= 800) {
++		return lv ? lv - 1 : 0;
++	}
++	if (lv > cap) {
++		return cap;
++	}
++	if (!active) {
++		return lv > GOV_NOMINAL || t < 750 ? GOV_NOMINAL : lv;
++	}
++	if (t < 750 && lv < GOV_NOMINAL) {
++		return GOV_NOMINAL;
++	}
++	if (t < 750 && lv < cap && may_step_up) {
++		return lv + 1;
++	}
++	return lv;
++}
++
++static void
++gov_thread(void *arg, wait_result_t result)
++{
++	(void)arg;
++	(void)result;
++	uint32_t cap = 3, changes = 0, logged = 0;
++	uint64_t step_up_ms = 0;
++	(void)PE_parse_boot_argn("sweetgovmax", &cap, sizeof(cap));
++	cap = MIN(MAX(cap, GOV_NOMINAL), (uint32_t)GOV_N - 1);
++	if (!perf_volt_up()) {
++		printf("SWEET GOV: S11 not raised, governor off (nominal clocks)\n");
++		return;
++	}
++	printf("SWEET GOV: on, cap %u/%u MHz; >= 80 C step down, >= 90 C %u/%u MHz, up below 75 C while active\n",
++	    gov_lv[cap].perf, gov_lv[cap].pwr, gov_lv[0].perf, gov_lv[0].pwr);
++	uint64_t swaps = sweet_fb_stat_swaps, active_until = 0, next_log = 0, ms = 0;
++	uint32_t moves = sweet_touch_moves, ticks_at[GOV_N] = {0};
++	int tmax = -1000;
++	for (;;) {
++		uint64_t deadline;
++		clock_interval_to_deadline(250, NSEC_PER_MSEC, &deadline);
++		(void)assert_wait_deadline(&gov_sleep_chan, THREAD_UNINT, deadline);
++		thread_block(THREAD_CONTINUE_NULL);
++		ms += 250;
++		int t = gov_temp();
++		tmax = MAX(tmax, t);
++		if (sweet_fb_stat_swaps != swaps || sweet_touch_moves != moves) {
++			active_until = ms + 2000;
++			swaps = sweet_fb_stat_swaps;
++			moves = sweet_touch_moves;
++		}
++		bool active = ms < active_until;
++		uint32_t want = gov_next(gov_level, t, active, cap, ms >= step_up_ms);
++		if (want != gov_level) {
++			uint32_t from = gov_level;
++			if (gov_set(want)) {
++				gov_level = want;
++				changes++;
++				if (want > from) {
++					step_up_ms = ms + 500;
++				}
++				if (logged++ < 40) {
++					printf("SWEET GOV: %u/%u -> %u/%u MHz (%d.%d C, %s)\n", gov_lv[from].perf, gov_lv[from].pwr,
++					    gov_lv[want].perf, gov_lv[want].pwr, t / 10, (t % 10 + 10) % 10, active ? "active" : "idle");
++				}
++			} else if (!gov_set(from)) {
++				printf("SWEET GOV: back to %u/%u MHz FAILED too, governor stops\n", gov_lv[from].perf, gov_lv[from].pwr);
++				return;
++			}
++		}
++		ticks_at[gov_level]++;
++		if (ms >= next_log) {          /* every 10 s: where the time went */
++			next_log = ms + 10000;
++			printf("SWEET GOV: now %u/%u MHz, hottest %d.%d C (max %d.%d), %u changes, 250 ms ticks per level %u/%u/%u/%u/%u\n",
++			    gov_lv[gov_level].perf, gov_lv[gov_level].pwr, t / 10, (t % 10 + 10) % 10, tmax / 10, (tmax % 10 + 10) % 10,
++			    changes, ticks_at[0], ticks_at[1], ticks_at[2], ticks_at[3], ticks_at[4]);
++			changes = 0;
++			tmax = -1000;
++			bzero(ticks_at, sizeof(ticks_at));
++		}
++	}
++}
++
+ static uint64_t
+ perf_ns(uint64_t abs)
+ {
+@@ -535,6 +722,16 @@ perf_thread(void *arg, wait_result_t result)
+ 		printf("SWEET PERF: DDR vote %d MHz %s: %llu -> %llu MHz\n", ddr, ok ? "acked" : "FAILED",
+ 		    before, clk_measure_mhz(0xad) * 2);
+ 	}
++	int gov = 1;
++	(void)PE_parse_boot_argn("sweetgov", &gov, sizeof(gov));
++	if (gov && gov_apc0 && gov_apc1) {
++		thread_t gt;
++		if (kernel_thread_start(gov_thread, NULL, &gt) == KERN_SUCCESS) {
++			thread_deallocate(gt);
++		}
++	} else if (gov) {
++		printf("SWEET GOV: not started (clocks not nominal at 905 mV, or sweetboost/sweetturbo set)\n");
++	}
+ 	for (int c = 0; c < (int)ml_get_cpu_count(); c++) {
+ 		thread_bind(cpu_to_processor(c));
+ 		thread_block(THREAD_CONTINUE_NULL);
