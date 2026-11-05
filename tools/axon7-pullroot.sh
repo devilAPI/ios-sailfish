@@ -11,9 +11,15 @@
 # force-reset iOS can leave journal transactions that XNU would replay over
 # edits made on Linux).
 #
-# Usage: tools/axon7-pullroot.sh [IMG]   (default research/axon7/ios16-root.img)
+# --allow-dirty: copy the volume as it is even with a dirty journal (raw
+# chunks only); then replay the journal on the PC (fsck.hfsplus -fy) and
+# check it before editing or writing anything back.
+#
+# Usage: tools/axon7-pullroot.sh [--allow-dirty] [IMG]   (default research/axon7/ios16-root.img)
 set -euo pipefail
 cd "$(dirname "$0")/.."
+dirty=0
+[[ ${1:-} == --allow-dirty ]] && { dirty=1; shift; }
 img=${1:-research/axon7/ios16-root.img}
 rec=${img%.img}.onphone.img
 dev=/dev/block/bootdevice/by-name/userdata
@@ -28,27 +34,33 @@ trap 'rm -rf "$tmp"' EXIT
 
 # 1. HFS+ state on the phone: clean unmount bit and empty journal
 adb exec-out "dd if=$dev bs=4096 count=1 2>/dev/null" > "$tmp/vh"
-python3 -I - "$tmp/vh" <<'EOF' > "$tmp/jinfo"
+DIRTY=$dirty python3 -I - "$tmp/vh" <<'EOF' > "$tmp/jinfo"
 import struct, sys
 b = open(sys.argv[1], 'rb').read()[1024:1536]
 sig, ver, attr, lmv, jib = struct.unpack('>2sHI4sI', b[:16])
 bs = struct.unpack('>I', b[40:44])[0]
 assert sig in (b'H+', b'HX'), f'no HFS+ volume header ({sig})'
-assert attr & 0x100, 'volume was not unmounted cleanly'
+import os
+if not attr & 0x100:
+    assert os.environ.get('DIRTY') == '1', 'volume was not unmounted cleanly'
+    print('warning: volume not unmounted cleanly (--allow-dirty)', file=sys.stderr)
 print(jib, bs)
 EOF
 read -r jib bs < "$tmp/jinfo"
 adb exec-out "dd if=$dev bs=$bs skip=$jib count=1 2>/dev/null" > "$tmp/jib"
 joff=$(python3 -I -c 'import struct,sys; print(struct.unpack(">Q", open(sys.argv[1],"rb").read()[36:44])[0])' "$tmp/jib")
 adb exec-out "dd if=$dev bs=512 skip=$((joff / 512)) count=1 2>/dev/null" > "$tmp/jh"
-python3 -I - "$tmp/jh" <<'EOF'
-import struct, sys
+DIRTY=$dirty python3 -I - "$tmp/jh" <<'EOF'
+import os, struct, sys
 h = open(sys.argv[1], 'rb').read()
 fmt = '<' if struct.unpack('<I', h[:4])[0] == 0x4a4e4c78 else '>'
 magic, endian, start, end = struct.unpack(fmt + 'IIQQ', h[:24])
 assert magic == 0x4a4e4c78, 'no journal header'
-assert start == end, f'journal has pending transactions ({start} != {end}): shut iOS down cleanly first'
-print('volume clean, journal empty')
+if start != end:
+    assert os.environ.get('DIRTY') == '1', f'journal has pending transactions ({start} != {end}): shut iOS down cleanly first'
+    print(f'journal has pending transactions ({start} != {end}): copying raw (--allow-dirty)')
+else:
+    print('volume clean, journal empty')
 EOF
 
 # 2. hashes on both sides
