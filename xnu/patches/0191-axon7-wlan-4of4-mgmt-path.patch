@@ -1,0 +1,57 @@
+diff --git a/bsd/dev/sailfish_wlan.c b/bsd/dev/sailfish_wlan.c
+index 47620f2..333b4f9 100644
+--- a/bsd/dev/sailfish_wlan.c
++++ b/bsd/dev/sailfish_wlan.c
+@@ -2496,6 +2496,26 @@ wl_data_tx(const uint8_t *da, uint16_t type, const uint8_t *body, uint32_t len)
+ 	return wl_htt_tx(f, n + 8 + len, false);
+ }
+ 
++/*
++ * The same data frame (802.11 header + LLC/SNAP + body) sent on the
++ * management path (ext tid 17, raw frame, as auth and assoc): the firmware
++ * transmits it as built, past the data path's peer state. Used for EAPOL 4/4
++ * when the data path does not complete it (Axon 7 firmware, HTT 3.28).
++ */
++static bool
++wl_data_tx_raw(const uint8_t *da, uint16_t type, const uint8_t *body, uint32_t len)
++{
++	static uint8_t f[2048];
++	uint32_t n = wl_hdr(f, 0x08, 0x01, da);
++	const uint8_t snap[8] = { 0xaa, 0xaa, 3, 0, 0, 0, (uint8_t)(type >> 8), (uint8_t)type };
++	if (n + 8 + len > sizeof(f)) {
++		return false;
++	}
++	memcpy(f + n, snap, 8);
++	memcpy(f + n + 8, body, len);
++	return wl_htt_tx(f, n + 8 + len, true);
++}
++
+ static bool
+ wl_wmi_simple(uint32_t cmd, uint32_t tag, const uint32_t *v, uint32_t words)
+ {
+@@ -2653,9 +2673,22 @@ wl_4way(void)
+ 			memcpy(r + EK_REPLAY, e + EK_REPLAY, 8);
+ 			wl_hmac_sha1(ptk, 16, r, rl, NULL, 0, mic);
+ 			memcpy(r + EK_MIC, mic, 16);
+-			bool sent = wl_data_tx(wl_bss.bssid, 0x888e, r, rl) && wl_tx_wait(2000);
+-			printf("SAILFISH WLAN: EAPOL 3/4 (info %#x, GTK %s id %u) -> 4/4 %s (tx status %u)\n", info, gtk_ok ? "ok" : "MISSING",
+-			    gtk_id, sent ? "sent" : "SEND FAILED", wl_txc_status);
++			bool sent = wl_data_tx(wl_bss.bssid, 0x888e, r, rl) && wl_tx_wait(500);
++			const char *how = "data path";
++			if (!sent) {
++				/*
++				 * No completion: send it again as a raw frame on the
++				 * management path; the AP not repeating 3/4 within 1.5 s
++				 * means it took the 4/4.
++				 */
++				how = "management path";
++				sent = wl_data_tx_raw(wl_bss.bssid, 0x888e, r, rl);
++				for (uint64_t t = wl_ms() + 1500; sent && wl_ms() < t && !wl_eapol_len;) {
++					(void)wl_htc_poll(10);
++				}
++			}
++			printf("SAILFISH WLAN: EAPOL 3/4 (info %#x, GTK %s id %u) -> 4/4 %s on the %s (tx status %u)\n", info, gtk_ok ? "ok" : "MISSING",
++			    gtk_id, sent ? "sent" : "SEND FAILED", how, wl_txc_status);
+ 			/*
+ 			 * Axon 7: with all CPUs busy the 4/4 can go out after the AP's
+ 			 * retry timer; the AP then repeats 3/4 with a higher replay
