@@ -2,8 +2,9 @@
 
 Status (2026-11-05): **iOS 16.7.16 boots to the lock screen and home screen
 on the Axon 7, GPU-accelerated, unlocks with Volume Down (Home), touch works,
-rootless jailbreak with Sileo pre-installed.** Wi-Fi scans but does not
-finish the WPA2 handshake yet (see To do).
+rootless jailbreak with Sileo pre-installed.** Wi-Fi connects (WPA2-PSK,
+DHCP, Safari, Sileo) since patch 0191, but the Wi-Fi firmware crashed
+after about 20 s of heavy traffic; patch 0192 is the fix under test (see To do).
 
 | Area | State on the Axon 7 |
 | --- | --- |
@@ -13,7 +14,7 @@ finish the WPA2 handshake yet (see To do).
 | Clocks | DDR 1804 MHz, CPU 1228/1363 MHz (`sweetddr=1804`, `sweetclk` on) |
 | Storage | iOS root = journaled HFS+ in `userdata`, read-write |
 | Touch / keys | Synaptics RMI4 F12 (1439x2559, IRQ), Power, Volume Up, Volume Down = Home |
-| Wi-Fi | QCA6174 up, scans, auth + assoc OK; EAPOL 4/4 does not complete with the phone's own firmware (HTT 3.28) |
+| Wi-Fi | QCA6174 with the phone's own firmware (HTT 3.28): scan, WPA2-PSK join (4/4 on the management path), DHCP, traffic; firmware crash under load (0192 testing) |
 | Jailbreak | Procursus rootless bootstrap (`/var/jb`, CF 1900) + Sileo 2.5.1, set up on first boot by a launchd job |
 | Shutdown | power off / restart through PSCI with PMIC PS_HOLD config (patch 0190) |
 
@@ -65,7 +66,8 @@ branch `axon7`). The iOS root uses `tools/mkiosroot.sh` (needs apfs-fuse, hfspro
 | 0188 | volume keys on PM8994 GPIO 2/3 |
 | 0189 | Wi-Fi: answer a repeated EAPOL 3/4 before installing keys |
 | 0190 | power off / restart: UFS cache flush, PM8994 PS_HOLD type, PSCI SYSTEM_OFF/RESET |
-| 0191 | Wi-Fi: EAPOL 4/4 resent on the management path when the data path stalls (testing) |
+| 0191 | Wi-Fi: EAPOL 4/4 resent on the management path when the data path stalls (the AP takes it: connects) |
+| 0192 | Wi-Fi: tx msdu ids tracked per slot (never reuse one the firmware holds), rx ring refilled by buffer address (out-of-order release), 4/4 only on the management path, firmware crash dump (`hi_failure_state`) (testing) |
 
 Boot-args in use (`research/axon7/bootargs-*.txt`, 418 of 608 bytes):
 
@@ -100,7 +102,8 @@ pull with `--allow-dirty` and replay the journal first.
 
 ## To do
 
-- **Wi-Fi**: works up to the 4-way handshake: firmware (own `qwlan30.bin`, HTT 3.28, OTP board id 0 -> `bdwlan30.bin`), PCIe INTA (SPI 244), scan, auth, assoc, EAPOL 1/4 -> 2/4, 3/4 received. Our 4/4 never gets a tx completion on the data path and the AP repeats 3/4 (patches 0189, 0191). If the management-path 4/4 does not help: compare HTT tx descriptors for 3.28 vs 3.50, or a newer Rome firmware.
+- **Wi-Fi**: firmware (own `qwlan30.bin`, HTT 3.28, OTP board id 0 -> `bdwlan30.bin`), PCIe INTA (SPI 244), scan, auth, assoc, 4-way handshake and traffic work. EAPOL 4/4 on the data path never completes and the AP never takes it (50 tries); the same frame on the management path (ext tid 17) it takes (0191, 0192). With 0191 the firmware crashed (`fw_ind` 0x3, CE 4 stuck) after ~850 tx / 1300 rx frames; 0192 fixes two host bugs that can do that (msdu id reuse, rx ring buffers handed back while the firmware still held them) and prints the firmware's crash dump if it happens again. Open: restart the firmware and rejoin after a crash instead of staying offline.
+- **Logs**: the log ring restarts at offset 0 every boot; bytes past the current boot's `total` in `*-ring.txt.bin` are the tail of the previous, longer boot (the 0191 Wi-Fi result was found there).
 - **Dual boot with postmarketOS**: pmOS rootfs on microSD; a shim boot menu (volume key) to start either XNU or Linux.
 - **Dynamic GPU clock**: 600 MHz only while animating (600 fixed runs warm; the driver has 300/400/600 only, 510/560 need mmpll9).
 - **Brightness**: the DCS 0x51 write over DSI0 never completes on the split-DSI panel ("panel level ... FAILED"); likely needs the broadcast setup of both DSI controllers.
