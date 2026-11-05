@@ -1,0 +1,366 @@
+diff --git a/bsd/dev/sailfish_wlan.c b/bsd/dev/sailfish_wlan.c
+index 333b4f9..73a771d 100644
+--- a/bsd/dev/sailfish_wlan.c
++++ b/bsd/dev/sailfish_wlan.c
+@@ -1452,8 +1452,65 @@ static uint8_t wl_wmi_ep = 0xff, wl_htt_ep = 0xff, wl_seq[8], wl_mac[6];
+ static uint32_t wl_htt_alloc, wl_htt_rd, wl_htt_rx;    /* HTT rx ring: host write and read index, MSDUs indicated */
+ static uint32_t wl_htt_types;                   /* HTT T2H message types seen (logged once each) */
+ static int32_t wl_txc_id = -1;                  /* last HTT tx completion: msdu id, status */
+-static uint16_t wl_txc_n;                       /* tx completions so far (data and management) */
+ static uint32_t wl_txc_status;
++/*
++ * HTT msdu ids (= tx slots) the firmware still owns: set when a frame is
++ * handed over, cleared by the id in its completion (TX_COMPL_IND or
++ * MGMT_TX_COMPLETION). A busy id is never reused (as ath10k's msdu idr):
++ * the firmware keeps per-id state and DMAs from the slot's frame buffer.
++ */
++static uint32_t wl_tx_busy;
++static uint16_t wl_tx_id;                       /* frames handed to the firmware */
++static uint32_t wl_tx_slot;                     /* msdu id of the last one */
++static uint64_t wl_tx_since[32];                /* wl_ms() when each slot was handed over */
++static uint32_t wl_tx_reclaimed, wl_tx_full;    /* slots given up after 10 s; frames dropped with all slots busy */
++static bool wl_fw_dead;                         /* FW_IND_EVENT_PENDING seen: the firmware crashed */
++
++static void
++wl_tx_done(uint32_t id, uint32_t status)
++{
++	if (id < 32) {
++		wl_tx_busy &= ~(1u << id);
++		wl_txc_id = (int32_t)id;
++		wl_txc_status = status;
++	}
++}
++
++/*
++ * Firmware crash (FW_IND_EVENT_PENDING): print, once, the register dump
++ * the firmware leaves at host interest hi_failure_state (60 words, as
++ * ath10k_pci_dump_registers: assert info, PC, bad address, registers)
++ * and the host's tx/rx state at that moment.
++ */
++static bool
++wl_fw_crashed(const char *where)
++{
++	if (wl_fw_dead) {
++		return true;
++	}
++	uint32_t fwi = rd(wl_bar, Q_FW_IND), area = 0, v[8];
++	if (!(fwi & 1u)) {
++		return false;
++	}
++	wl_fw_dead = true;
++	printf("SAILFISH WLAN: FIRMWARE CRASHED (%s): fw_ind %#x, tx ids busy %#x, frames out %u, slots reclaimed %u, full drops %u, rx alloc %u\n",
++	    where, fwi, wl_tx_busy, wl_tx_id, wl_tx_reclaimed, wl_tx_full, wl_htt_alloc);
++	if (!wl_diag_read32(HI(0x04), &area) || !area) {
++		printf("SAILFISH WLAN: firmware dump: no hi_failure_state (%#x)\n", area);
++		return true;
++	}
++	for (uint32_t i = 0; i < 60; i += 8) {
++		for (uint32_t j = 0; j < 8; j++) {
++			if (!wl_diag_read32(area + 4 * (i + j), &v[j])) {
++				return true;
++			}
++		}
++		printf("SAILFISH WLAN: firmware dump [%02u]: %08x %08x %08x %08x %08x %08x %08x %08x\n", i, v[0], v[1], v[2], v[3], v[4],
++		    v[5], v[6], v[7]);
++	}
++	sweet_log_kick();
++	return true;
++}
+ static uint8_t wl_eapol[512];                   /* last EAPOL-Key frame received */
+ static uint32_t wl_eapol_len;
+ static bool wl_net_up;                          /* connected: data frames go to the IOKit interface */
+@@ -1530,6 +1587,9 @@ wl_htc_send(struct wl_ce *c, uint8_t eid, uint32_t len)
+ {
+ 	uint32_t off = D_TX + (c == &ce3 ? 0x800u : c == &ce4 ? 0x1000u : 0);
+ 	volatile uint8_t *h = (volatile uint8_t *)(wl_dma + off);
++	if (wl_fw_dead) {
++		return false;
++	}
+ 	if (eid == wl_wmi_ep) {
+ 		for (int i = 0; i < 2000 && !wl_credits; i++) {
+ 			(void)wl_htc_poll(1);   /* credit reports come back in rx trailers */
+@@ -1550,6 +1610,9 @@ wl_htc_send(struct wl_ce *c, uint8_t eid, uint32_t len)
+ 	wl_ce_send(c, WL_DMA_PA + off, len + 8, (uint16_t)(eid << 2));
+ 	uint32_t got = 0;
+ 	if (!wl_wait(c, NULL, &got, 1000)) {
++		if (wl_fw_crashed("htc send")) {
++			return false;
++		}
+ 		printf("SAILFISH WLAN: HTC send on ep %u FAILED\n", eid);
+ 		wl_ce_dump("htc tx", c);
+ 		return false;
+@@ -1563,6 +1626,25 @@ wl_htc_tx_payload(struct wl_ce *c)
+ 	return (uint8_t *)(wl_dma + D_TX + (c == &ce3 ? 0x800u : c == &ce4 ? 0x1000u : 0) + 8);
+ }
+ 
++/* HTT rx buffer for a ring address (NULL if it is not one of ours). */
++static volatile uint8_t *
++wl_htt_buf(uint32_t pa)
++{
++	uint32_t o = pa - (WL_DMA_PA + D_HTT_BUF);
++	if (pa < WL_DMA_PA + D_HTT_BUF || o >= 2048 * HTT_RING_N || (o & 2047u)) {
++		return NULL;
++	}
++	return (volatile uint8_t *)(wl_dma + D_HTT_BUF + o);
++}
++
++/* Give an emptied rx buffer back: its address at the alloc index (the caller publishes D_HTT_IDX). */
++static void
++wl_htt_refill(uint32_t pa)
++{
++	((volatile uint32_t *)(wl_dma + D_HTT_RING))[wl_htt_alloc] = pa;
++	wl_htt_alloc = (wl_htt_alloc + 1) & (HTT_RING_N - 1);
++}
++
+ /* Last received WMI event / HTC control message (copied out of the rx buffer). */
+ static uint8_t wl_msg[2048];
+ static uint32_t wl_msg_len;
+@@ -1611,14 +1693,19 @@ wl_htc_poll(uint32_t ms)
+ 				 * HTT RX_IND: the firmware filled ring buffers in order. Per MPDU,
+ 				 * take MSDUs from the read index up to the one marked last
+ 				 * (htt_rx_desc_v1: attention +4, msdu_start +24, msdu_end info0
+-				 * +56, payload +300) and hand each slot back: slot i always holds
+-				 * buffer i, so advancing the alloc index recycles them.
++				 * +56, payload +300); each buffer goes back into the ring at the
++				 * alloc index (wl_htt_refill).
+ 				 */
+ 				uint32_t nr = f[8 + 7], fwd = f[8 + 44] | (uint32_t)f[8 + 45] << 8, ro = 8 + 48 + ((fwd + 3) & ~3u);
+ 				for (uint32_t i = 0; i < nr && ro + 4 * i + 4 <= 8 + len; i++) {
+ 					for (uint32_t m = 0; m < f[ro + 4 * i]; m++) {
+ 						for (int guard = 0; guard < 8; guard++) {
+-							volatile uint8_t *b = (volatile uint8_t *)(wl_dma + D_HTT_BUF + 2048 * wl_htt_rd);
++							uint32_t pa = ((volatile uint32_t *)(wl_dma + D_HTT_RING))[wl_htt_rd];
++							volatile uint8_t *b = wl_htt_buf(pa);
++							if (!b) {
++								printf("SAILFISH WLAN: rx ring: bad paddr %#x at %u\n", pa, wl_htt_rd);
++								break;
++							}
+ 							volatile uint32_t *d = (volatile uint32_t *)b;
+ 							uint32_t att = d[1], ml = d[6] & 0x3fffu;
+ 							bool last = d[14] & (1u << 15);
+@@ -1627,37 +1714,40 @@ wl_htc_poll(uint32_t ms)
+ 							}
+ 							d[1] = 0;
+ 							wl_htt_rd = (wl_htt_rd + 1) & (HTT_RING_N - 1);
+-							wl_htt_alloc = (wl_htt_alloc + 1) & (HTT_RING_N - 1);
++							wl_htt_refill(pa);
+ 							if (last || !(att & (1u << 31))) {
+ 								break;
+ 							}
+ 						}
+ 					}
+ 				}
++				__asm__ volatile ("dsb sy" ::: "memory");      /* ring entries before the index */
+ 				*(volatile uint32_t *)(wl_dma + D_HTT_IDX) = wl_htt_alloc;
+ 			}
+-			if (eid == wl_htt_ep && len - tl >= 1 && f[8] == 14) {     /* MGMT_TX_COMPLETION */
+-				wl_txc_n++;
++			if (eid == wl_htt_ep && len - tl >= 12 && f[8] == 14) {    /* MGMT_TX_COMPLETION: 3 reserved, desc id, status */
++				wl_tx_done(f[12] | f[13] << 8 | f[14] << 16 | (uint32_t)f[15] << 24,
++				    f[16] | f[17] << 8 | f[18] << 16 | (uint32_t)f[19] << 24);
+ 			}
+ 			if (eid == wl_htt_ep && len - tl >= 8 && f[8] == 18) {
+ 				/*
+ 				 * RX_IN_ORD_PADDR_IND (this firmware's rx path): {info (bit 5
+ 				 * offload), peer, vdev, count}, then per MSDU {paddr, len}.
+ 				 * Normal MSDUs keep the rx descriptor in front (payload +300),
+-				 * offloaded ones a 9-byte header. Ring slots are consumed in
+-				 * order, so advancing the alloc index by count recycles them.
++				 * offloaded ones a 9-byte header. The firmware's reorder queue
++				 * can release buffers out of ring order (A-MPDU holes): each
++				 * freed buffer is written back into the ring at the alloc index
++				 * (as ath10k's replenish), never "slot i = buffer i".
+ 				 */
+ 				uint32_t cnt = f[14] | f[15] << 8;
+ 				bool off = f[9] & 0x20u;
+ 				for (uint32_t i = 0; i < cnt && 16 + 8 * i + 8 <= 8 + len; i++) {
+ 					const volatile uint8_t *m = f + 16 + 8 * i;
+ 					uint32_t pa = m[0] | m[1] << 8 | m[2] << 16 | (uint32_t)m[3] << 24, ml = m[4] | m[5] << 8;
+-					uint32_t idx = (pa - (WL_DMA_PA + D_HTT_BUF)) / 2048;
+-					if (pa < WL_DMA_PA + D_HTT_BUF || idx >= HTT_RING_N) {
++					volatile uint8_t *b = wl_htt_buf(pa);
++					if (!b) {
+ 						printf("SAILFISH WLAN: rx in-order: bad paddr %#x\n", pa);
+ 						continue;
+ 					}
+-					volatile uint8_t *b = (volatile uint8_t *)(wl_dma + D_HTT_BUF + 2048 * idx);
+ 					volatile uint32_t *d = (volatile uint32_t *)b;
+ 					if (off) {
+ 						ml = b[0] | b[1] << 8;
+@@ -1666,16 +1756,15 @@ wl_htc_poll(uint32_t ms)
+ 						wl_rx_msdu(b + 300, ml < 2048 - 300 ? ml : 2048 - 300, d[1]);
+ 						d[1] = 0;
+ 					}
++					wl_htt_refill(pa);
+ 				}
+-				wl_htt_alloc = (wl_htt_alloc + cnt) & (HTT_RING_N - 1);
++				__asm__ volatile ("dsb sy" ::: "memory");      /* ring entries before the index */
+ 				*(volatile uint32_t *)(wl_dma + D_HTT_IDX) = wl_htt_alloc;
+ 			}
+ 			if (eid == wl_htt_ep && len - tl >= 6 && f[8] == 7) {  /* TX_COMPL_IND: status, count, ids */
+ 				uint32_t nm = f[10];
+-				wl_txc_status = f[9] & 7u;
+-				wl_txc_n = (uint16_t)(wl_txc_n + nm);
+-				if (nm && 12 + 2 * nm <= 8 + len) {
+-					wl_txc_id = f[10 + 2 * nm] | f[11 + 2 * nm] << 8;     /* the last one */
++				for (uint32_t i = 0; i < nm && 14 + 2 * i <= 8 + len - tl; i++) {
++					wl_tx_done(f[12 + 2 * i] | f[13 + 2 * i] << 8, f[9] & 7u);
+ 				}
+ 			}
+ 			wl_msg_len = len - tl;
+@@ -2209,7 +2298,8 @@ scan:
+ #define TAG_STA_PS_MODE                 0x6cu
+ #define D_TXFRAG                        0x21800u        /* HTT tx fragment lists, 16 bytes per slot: {paddr, len}, {0, 0} */
+ #define D_TXF                           0x22000u        /* HTT tx frames, 2 KB per slot */
+-#define WL_TXSLOTS                      32u             /* slot = msdu id % 32; the firmware holds at most 31 */
++#define WL_TXSLOTS                      32u             /* msdu ids 0..31, one 2 KB frame buffer each */
++_Static_assert(WL_TXSLOTS <= 32, "wl_tx_busy is a 32-bit map");
+ 
+ /* EAPOL-Key frame offsets, 802.1X header included. */
+ #define EK_INFO         5
+@@ -2418,21 +2508,50 @@ wl_wait_mgmt(uint8_t fc, uint32_t ms, uint32_t *flen)
+  * (native wifi, non-QoS tid 16) through a fragment list. Completion: HTT
+  * TX_COMPL_IND with the msdu id (wl_txc_id).
+  */
+-static uint16_t wl_tx_id;
++/*
++ * A free msdu id: the next one after the last that the firmware does not
++ * hold. All busy: poll for completions up to 100 ms, then drop the frame
++ * (reusing a busy id corrupts the firmware's tx state). An id without a
++ * completion for 10 s is taken as lost and reclaimed (logged).
++ */
++static int32_t
++wl_tx_slot_get(void)
++{
++	for (uint64_t end = wl_ms() + 100;;) {
++		uint64_t now = wl_ms();
++		for (uint32_t k = 1; k <= WL_TXSLOTS; k++) {
++			uint32_t i = (wl_tx_slot + k) % WL_TXSLOTS;
++			if ((wl_tx_busy & (1u << i)) && now - wl_tx_since[i] > 10000) {
++				wl_tx_busy &= ~(1u << i);
++				if (wl_tx_reclaimed++ < 20) {
++					printf("SAILFISH WLAN: tx: msdu id %u had no completion in 10 s, reclaimed\n", i);
++				}
++			}
++			if (!(wl_tx_busy & (1u << i))) {
++				return (int32_t)i;
++			}
++		}
++		if (now >= end || wl_fw_dead) {
++			if (wl_tx_full++ < 20) {
++				printf("SAILFISH WLAN: tx: all %u msdu ids busy for 100 ms, frame dropped\n", WL_TXSLOTS);
++			}
++			return -1;
++		}
++		(void)wl_htc_poll(1);
++	}
++}
+ 
+ static bool
+ wl_htt_tx(const uint8_t *fr, uint32_t len, bool mgmt)
+ {
+-	/* A free slot: wait for completions while 31 frames are out (a lost completion times out). */
+-	for (uint64_t end = wl_ms() + 50; (uint16_t)(wl_tx_id - wl_txc_n) >= WL_TXSLOTS - 1;) {
+-		if (wl_ms() >= end) {
+-			wl_txc_n = wl_tx_id;
+-			break;
+-		}
+-		(void)wl_htc_poll(1);
++	int32_t free_slot = wl_tx_slot_get();
++	if (free_slot < 0) {
++		return false;
+ 	}
+-	uint16_t flags1 = (uint16_t)((mgmt ? 17u : 16u) << 6 | 1u << 11), id = ++wl_tx_id;
+-	uint32_t slot = id % WL_TXSLOTS, fo = D_TXF + 2048 * slot, lo = D_TXFRAG + 16 * slot;
++	uint16_t flags1 = (uint16_t)((mgmt ? 17u : 16u) << 6 | 1u << 11);
++	uint32_t slot = (uint32_t)free_slot, fo = D_TXF + 2048 * slot, lo = D_TXFRAG + 16 * slot;
++	wl_tx_id++;
++	wl_tx_slot = slot;
+ 	uint8_t *f = (uint8_t *)(wl_dma + fo), *p = wl_htc_tx_payload(&ce4);
+ 	volatile uint32_t *frag = (volatile uint32_t *)(wl_dma + lo);
+ 	uint32_t pre = ((len < 50 ? len : 50) + 3) & ~3u, pa = WL_DMA_PA + (mgmt ? fo : lo);
+@@ -2455,19 +2574,16 @@ wl_htt_tx(const uint8_t *fr, uint32_t len, bool mgmt)
+ 	p[14] = p[15] = 0;
+ 	memcpy(p + 16, f, pre);
+ 	wl_txc_id = -1;
+-	return wl_htc_send(&ce4, wl_htt_ep, 16 + pre);
+-}
+-
+-static bool
+-wl_tx_wait(uint32_t ms)
+-{
+-	int32_t slot = (int32_t)(wl_tx_id % WL_TXSLOTS);
+-	for (uint64_t end = wl_ms() + ms; wl_ms() < end && wl_txc_id != slot;) {
+-		(void)wl_htc_poll(10);
++	wl_tx_busy |= 1u << slot;
++	wl_tx_since[slot] = wl_ms();
++	if (!wl_htc_send(&ce4, wl_htt_ep, 16 + pre)) {
++		wl_tx_busy &= ~(1u << slot);            /* never reached the firmware */
++		return false;
+ 	}
+-	return wl_txc_id == slot;
++	return true;
+ }
+ 
++
+ /* 802.11 header to the BSS: A1 BSSID, A2 us, A3 a3. */
+ static uint32_t
+ wl_hdr(uint8_t *f, uint8_t fc0, uint8_t fc1, const uint8_t *a3)
+@@ -2499,8 +2615,9 @@ wl_data_tx(const uint8_t *da, uint16_t type, const uint8_t *body, uint32_t len)
+ /*
+  * The same data frame (802.11 header + LLC/SNAP + body) sent on the
+  * management path (ext tid 17, raw frame, as auth and assoc): the firmware
+- * transmits it as built, past the data path's peer state. Used for EAPOL 4/4
+- * when the data path does not complete it (Axon 7 firmware, HTT 3.28).
++ * transmits it as built, past the data path's peer state. Used for EAPOL
++ * 4/4: on the Axon 7 firmware (HTT 3.28) the data path never completes it
++ * and the AP never takes it (50 tries); the management-path copy it takes.
+  */
+ static bool
+ wl_data_tx_raw(const uint8_t *da, uint16_t type, const uint8_t *body, uint32_t len)
+@@ -2673,22 +2790,19 @@ wl_4way(void)
+ 			memcpy(r + EK_REPLAY, e + EK_REPLAY, 8);
+ 			wl_hmac_sha1(ptk, 16, r, rl, NULL, 0, mic);
+ 			memcpy(r + EK_MIC, mic, 16);
+-			bool sent = wl_data_tx(wl_bss.bssid, 0x888e, r, rl) && wl_tx_wait(500);
+-			const char *how = "data path";
+-			if (!sent) {
+-				/*
+-				 * No completion: send it again as a raw frame on the
+-				 * management path; the AP not repeating 3/4 within 1.5 s
+-				 * means it took the 4/4.
+-				 */
+-				how = "management path";
+-				sent = wl_data_tx_raw(wl_bss.bssid, 0x888e, r, rl);
+-				for (uint64_t t = wl_ms() + 1500; sent && wl_ms() < t && !wl_eapol_len;) {
+-					(void)wl_htc_poll(10);
+-				}
++			/*
++			 * 4/4 straight on the management path (patch 0192): the data-path
++			 * copy never completed on this firmware and kept its msdu id busy.
++			 * The AP not repeating 3/4 within 1.5 s means it took the 4/4.
++			 */
++			bool sent = wl_data_tx_raw(wl_bss.bssid, 0x888e, r, rl);
++			for (uint64_t t = wl_ms() + 1500; sent && wl_ms() < t && !wl_eapol_len;) {
++				(void)wl_htc_poll(10);
+ 			}
+-			printf("SAILFISH WLAN: EAPOL 3/4 (info %#x, GTK %s id %u) -> 4/4 %s on the %s (tx status %u)\n", info, gtk_ok ? "ok" : "MISSING",
+-			    gtk_id, sent ? "sent" : "SEND FAILED", how, wl_txc_status);
++			bool completed = sent && !(wl_tx_busy & (1u << wl_tx_slot));
++			printf("SAILFISH WLAN: EAPOL 3/4 (info %#x, GTK %s id %u) -> 4/4 %s on the management path (%s %u)\n", info,
++			    gtk_ok ? "ok" : "MISSING", gtk_id, sent ? "sent" : "SEND FAILED", completed ? "completion status" : "no completion, id",
++			    completed ? wl_txc_status : wl_tx_slot);
+ 			/*
+ 			 * Axon 7: with all CPUs busy the 4/4 can go out after the AP's
+ 			 * retry timer; the AP then repeats 3/4 with a higher replay
+@@ -3313,8 +3427,9 @@ wl_run(void)
+ 		}
+ 		if (wl_ms() >= next) {                  /* status every 10 s */
+ 			next += 10000;
++			(void)wl_fw_crashed("status");
+ 			printf("SAILFISH WLAN: run: tx %u (drop %u) rx %u, irqs %u, tx out %u, ifq %u, fw_ind %#x, ltssm %#x lnk %#x, %d.%d C (sensor %d.%d)\n", tx, txdrop,
+-			    wl_htt_rx - rx0, wl_irqs, (uint16_t)(wl_tx_id - wl_txc_n), wl_ifq_count, rd(wl_bar, Q_FW_IND),
++			    wl_htt_rx - rx0, wl_irqs, (uint32_t)__builtin_popcount(wl_tx_busy), wl_ifq_count, rd(wl_bar, Q_FW_IND),
+ 			    rd(wl_dbi, 0x728) & 0x3fu, rd(wl_dbi, DBI_LINK_STATUS) >> 16, wl_temp() / 10, (wl_temp() % 10 + 10) % 10,
+ 			    wl_temp_max_id / 16, wl_temp_max_id % 16);
+ 		}
