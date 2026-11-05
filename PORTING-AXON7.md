@@ -2,9 +2,9 @@
 
 Status (2026-11-05): **iOS 16.7.16 boots to the lock screen and home screen
 on the Axon 7, GPU-accelerated, unlocks with Volume Down (Home), touch works,
-rootless jailbreak with Sileo pre-installed.** Wi-Fi joins WPA2-PSK
-networks; internet worked once (0191, until a firmware crash) and not
-with 0192 (no DHCP address); 0193 is under test (see To do).
+rootless jailbreak with Sileo, OpenSSH.** Wi-Fi works on the first
+join of a boot (WPA2-PSK, DHCP, Safari, Sileo; 46k frames without a firmware
+crash, 0193); after a disconnect and rejoin iOS never runs DHCP again (see To do).
 
 | Area | State on the Axon 7 |
 | --- | --- |
@@ -14,8 +14,8 @@ with 0192 (no DHCP address); 0193 is under test (see To do).
 | Clocks | DDR 1804 MHz, CPU 1228/1363 MHz (`sweetddr=1804`, `sweetclk` on) |
 | Storage | iOS root = journaled HFS+ in `userdata`, read-write |
 | Touch / keys | Synaptics RMI4 F12 (1439x2559, IRQ), Power, Volume Up, Volume Down = Home |
-| Wi-Fi | QCA6174 with the phone's own firmware (HTT 3.28): scan, WPA2-PSK join (4/4 on the management path), DHCP + Safari once (0191, firmware crash under load), no DHCP with 0192, 0193 testing |
-| Jailbreak | Procursus rootless bootstrap (`/var/jb`, CF 1900) + Sileo 2.5.1, set up on first boot by a launchd job |
+| Wi-Fi | QCA6174 with the phone's own firmware (HTT 3.28): scan, WPA2-PSK join (4/4 on the management path), first join of a boot: DHCP, Safari, Sileo (0193); a rejoin gets no DHCP |
+| Jailbreak | Procursus rootless bootstrap (`/var/jb`, CF 1900) + Sileo 2.5.1 + OpenSSH 9.7 (`mobile`/`root`, password `alpine`); boot job `axon7-jbinit.sh`; `axon7-libkrw0-plugin-stub` so apt resolves |
 | Shutdown | power off / restart through PSCI with PMIC PS_HOLD config (patch 0190) |
 
 Hardware reference for the phone: https://github.com/devilAPI/zte-axon7 (`docs/`).
@@ -68,7 +68,8 @@ branch `axon7`). The iOS root uses `tools/mkiosroot.sh` (needs apfs-fuse, hfspro
 | 0190 | power off / restart: UFS cache flush, PM8994 PS_HOLD type, PSCI SYSTEM_OFF/RESET |
 | 0191 | Wi-Fi: EAPOL 4/4 resent on the management path when the data path stalls (the AP takes it: connects) |
 | 0192 | Wi-Fi: tx msdu ids tracked per slot (never reuse one the firmware holds), rx ring refilled by buffer address (out-of-order release), 4/4 only on the management path, firmware crash dump (`hi_failure_state`): 4/4 taken on the first try and no crash in 20 min, but DHCP never finished |
-| 0193 | Wi-Fi: 4/4 on the data path again before the management-path copy (0191 order); diagnostics: tx completion status counts, rx to us vs group, DHCP packets (testing) |
+| 0193 | Wi-Fi: 4/4 on the data path again before the management-path copy (0191 order); diagnostics: tx completion status counts, rx to us vs group, DHCP packets: DHCP and traffic work |
+| 0194 | Wi-Fi diagnostics: DHCP client MAC, broadcast flag, iOS source MAC (not built: CI's macos-14 runner is gone) |
 
 Boot-args in use (`research/axon7/bootargs-*.txt`, 418 of 608 bytes):
 
@@ -93,7 +94,8 @@ sweetddr=1804 sweetgpuclk=400 sailfishwlan=1
 | `tools/hfs-journal-replay.py` | replay an HFS+ journal like XNU (Linux fsck does not) |
 | `tools/hfs-btree-fix.py` | fix B-tree extents XNU refuses (Linux hfsplus leaves odd ones) |
 | `tools/axon7-root-add.sh` | install files into the root (sudo loop mount) |
-| `tools/axon7-jailbreak.sh` | Procursus bootstrap + Sileo + first-boot launchd job (`axon7-jbinit.sh`) |
+| `tools/axon7-jailbreak.sh` | Procursus bootstrap + Sileo + libkrw plugin stub + boot launchd job (`axon7-jbinit.sh`: first-boot setup; every boot Sileo's `sileolists`, pending `/var/jb/var/axon7/debs/*.deb`, `/var/jb/Library/LaunchDaemons`) |
+| `tools/axon7-krw-stub.sh` | build `axon7-libkrw0-plugin-stub` (Provides `libkrw0-plugin`; without it apt refuses every install) |
 | `tools/sweet-log-pull.sh` | kernel log ring from the end of `userdata` |
 
 Root editing cycle: `axon7-pullroot.sh` (phone in TWRP) -> edit with
@@ -103,7 +105,8 @@ pull with `--allow-dirty` and replay the journal first.
 
 ## To do
 
-- **Wi-Fi**: firmware (own `qwlan30.bin`, HTT 3.28, OTP board id 0 -> `bdwlan30.bin`), PCIe INTA (SPI 244), scan, auth, assoc, 4-way handshake and traffic work. EAPOL 4/4 on the data path never completes and the AP never takes it (50 tries); the same frame on the management path (ext tid 17) it takes (0191, 0192). With 0191 the firmware crashed (`fw_ind` 0x3, CE 4 stuck) after ~850 tx / 1300 rx frames; 0192 fixes two host bugs that can do that (msdu id reuse, rx ring buffers handed back while the firmware still held them) and prints the firmware's crash dump if it happens again. With 0192 (4/4 only on the management path) the link stayed up 20 min without a crash and broadcasts arrived, but iOS never got a DHCP address; 0191 (data-path 4/4 first, held by the firmware until the keys were in) had a working data path, so 0193 restores that order and logs the data path. Open: restart the firmware and rejoin after a crash instead of staying offline.
+- **Wi-Fi reconnect**: the first join of a boot works (0193: DHCP DISCOVER/OFFER/REQUEST/ACK to the radio's own MAC, 18.8k tx all completed OK, 27k rx, Sileo refresh, no firmware crash). After wifid asks to leave and joins again (Forget network, Private Address toggle, Wi-Fi off/on) the join succeeds but iOS hands down no frame at all: configd never restarts DHCP. Next: wifid/configd logs over SSH (`log stream`) while reproducing. Older notes: 4/4 on the data path never completes during the handshake (the firmware holds it until the keys are in) and the AP takes the management-path copy; without the data-path copy (0192) the data path stays dead. Private Wi-Fi Address is on in iOS but not applied (no setHardwareAddress), the AP answers the hardware MAC.
+- **Kernel CI**: GitHub retired the `macos-14` runner (`The configuration 'macos-14-arm64-us-default' is not supported`), and with it Xcode 15, which this xnu needs (Xcode 16's iig emits `IORPC.kernelContent`). Move `.github/workflows/xnu.yml` to macos-15 + Xcode 16 (patch the IORPC ABI) or another Xcode 15 source before any kernel change.
 - **Logs**: the log ring restarts at offset 0 every boot; bytes past the current boot's `total` in `*-ring.txt.bin` are the tail of the previous, longer boot (the 0191 Wi-Fi result was found there).
 - **Dual boot with postmarketOS**: pmOS rootfs on microSD; a shim boot menu (volume key) to start either XNU or Linux.
 - **Dynamic GPU clock**: 600 MHz only while animating (600 fixed runs warm; the driver has 300/400/600 only, 510/560 need mmpll9).

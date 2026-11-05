@@ -34,6 +34,9 @@ else
 fi
 sudo install -d -o 0 -g 0 -m 755 "$mnt/private/var/jb/var/axon7"
 sudo install -o 0 -g 0 -m 644 "$deb" "$mnt/private/var/jb/var/axon7/sileo.deb"
+# libkrw0-plugin placeholder: without it apt refuses every install (see tools/axon7-krw-stub.sh)
+stub=$(tools/axon7-krw-stub.sh "$(mktemp -d)/axon7-libkrw0-plugin-stub.deb" | cut -d' ' -f1)
+sudo install -D -o 0 -g 0 -m 644 "$stub" "$mnt/private/var/jb/var/axon7/debs/axon7-libkrw0-plugin-stub.deb"
 sudo install -o 0 -g 0 -m 755 tools/axon7-jbinit.sh "$mnt/private/var/jb/usr/libexec/axon7-jbinit.sh"
 
 # launchd job (launchd_unsecure_cache=1 reads /System/Library/xpc/launchd.plist)
