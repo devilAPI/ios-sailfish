@@ -3,7 +3,8 @@
 # pack KERNEL + the Axon 7 ADT (+ firmware blobs) into a payload, wrap it in
 # the loader shim, write it to the boot partition, reboot, wait for the
 # shim/kernel to reset back into TWRP (IMEM restart reason "recovery"), and
-# save the pmsg / console pstore zones to logs/.
+# save the pmsg / console pstore zones to logs/. A postmarketOS bundle on the
+# boot partition is kept (dual boot, tools/axon7-dualboot.py).
 # The ZTE LK has no `fastboot boot`, so the boot partition is used; restore
 # Android with: adb push backup/stock-lineage-boot.img /tmp/ && adb shell dd
 # if=/tmp/stock-lineage-boot.img of=/dev/block/bootdevice/by-name/boot
@@ -41,6 +42,25 @@ WDT_SECS=${WDT_SECS:-120} shim/build-axon7.sh backup/stock-lineage-boot.img load
 cp shim/out/axon7-loader.img "$out/boot.img"
 
 [ "$(adb get-state 2>/dev/null)" = recovery ] || { echo "phone is not in TWRP (adb recovery)" >&2; exit 1; }
+# Dual boot: keep the postmarketOS bundle the phone's boot partition carries
+# (tools/axon7-dualboot.py; Volume Down at boot starts it), or put in
+# PMOS_BUNDLE=FILE; KEEP_PMOS=0 writes iOS alone.
+bundle=${PMOS_BUNDLE:-}
+if [ -z "$bundle" ] && [ "${KEEP_PMOS:-1}" = 1 ]; then
+	adb exec-out 'dd if=/dev/block/bootdevice/by-name/boot bs=1M 2>/dev/null' > "$out/boot-before.img"
+	rc=0
+	python3 -I tools/axon7-dualboot.py extract "$out/boot-before.img" -o "$out/pmos.bundle" 2>/dev/null || rc=$?
+	case $rc in
+	0) bundle=$out/pmos.bundle; echo "keeping the postmarketOS bundle from the boot partition" ;;
+	3) echo "no postmarketOS bundle on the phone: iOS only" ;;
+	*) echo "boot partition's postmarketOS bundle is damaged: iOS only (old image in $out/boot-before.img)" >&2 ;;
+	esac
+fi
+if [ -n "$bundle" ]; then
+	python3 -I tools/axon7-dualboot.py combine "$out/boot.img" "$bundle" -o "$out/boot-dual.img"
+	python3 -I tools/axon7-dualboot.py check "$out/boot-dual.img" >/dev/null
+	mv "$out/boot-dual.img" "$out/boot.img"
+fi
 adb push "$out/boot.img" /tmp/axon7-boot.img >/dev/null
 adb shell 'dd if=/tmp/axon7-boot.img of=/dev/block/bootdevice/by-name/boot bs=1M 2>&1 && sync' | grep -v tzdata
 echo "boot partition written ($name), rebooting; waiting up to ${wait_s}s for TWRP"

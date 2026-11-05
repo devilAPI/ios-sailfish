@@ -9,6 +9,8 @@
 #include "console.h"
 #include "loader.h"
 #include "pstore.h"
+#include "pmic.h"
+#include "pmos.h"
 
 #define PSCI_SYSTEM_RESET	0x84000009UL
 #define IMEM_RESTART_REASON	0x066bf65cUL
@@ -67,6 +69,31 @@ void shim_main(uint64_t dtb)
 	con_clear(0);
 	con_str("SHIM", "axon7 (ailsa_ii) loader");
 	con_skip();
+
+	/*
+	 * Dual boot: Volume Down held (checked for 0.5 s, so a press during the
+	 * ZTE logo counts) starts postmarketOS from the ramdisk bundle; anything
+	 * going wrong there falls through to iOS.
+	 */
+	int vd = pmic_voldown_pressed();
+	for (int i = 0; vd == 0 && i < 50; i++) {
+		delay_ms(10);
+		vd = pmic_voldown_pressed();
+	}
+	plog_hex("VOLDOWN", (uint32_t)vd);
+	if (vd == 1) {
+		con_str("VOL-", "held: postmarketOS");
+		const char *pwhy = pmos_boot(dtb);
+		plog_str("PMOS: ");
+		plog_str(pwhy);
+		plog_str("\n");
+		con_str("PMOS", pwhy);
+		con_str("IOS", "booting iOS instead in 4s");
+		con_flush();
+		delay_ms(4000);
+	} else if (vd < 0) {
+		con_str("VOL-", "unreadable, booting iOS");
+	}
 	/*
 	 * Re-arm the watchdog for the kernel (bite WDT_SECS after this): a hang
 	 * then ends in a warm reset that keeps RAM, so the kernel's early log

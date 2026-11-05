@@ -17,6 +17,7 @@ crash, 0193); after a disconnect and rejoin iOS never runs DHCP again (see To do
 | Wi-Fi | QCA6174 with the phone's own firmware (HTT 3.28): scan, WPA2-PSK join (4/4 on the management path), first join of a boot: DHCP, Safari, Sileo (0193); a rejoin gets no DHCP |
 | Jailbreak | Procursus rootless bootstrap (`/var/jb`, CF 1900) + Sileo 2.5.1 + OpenSSH 9.7 (`mobile`/`root`, password `alpine`); boot job `axon7-jbinit.sh`; `axon7-libkrw0-plugin-stub` so apt resolves |
 | Shutdown | power off / restart through PSCI with PMIC PS_HOLD config (patch 0190) |
+| Dual boot | iOS by default; Volume Down held at the ZTE logo starts postmarketOS from a bundle in the boot image's ramdisk slot (shim `pmos.c`, `tools/axon7-dualboot.py`) |
 
 Hardware reference for the phone: https://github.com/devilAPI/zte-axon7 (`docs/`).
 
@@ -95,6 +96,8 @@ sweetddr=1804 sweetgpuclk=400 sailfishwlan=1
 | `tools/hfs-btree-fix.py` | fix B-tree extents XNU refuses (Linux hfsplus leaves odd ones) |
 | `tools/axon7-root-add.sh` | install files into the root (sudo loop mount) |
 | `tools/axon7-jailbreak.sh` | Procursus bootstrap + Sileo + libkrw plugin stub + boot launchd job (`axon7-jbinit.sh`: first-boot setup; every boot Sileo's `sileolists`, pending `/var/jb/var/axon7/debs/*.deb`, `/var/jb/Library/LaunchDaemons`) |
+| `tools/axon7-dualboot.py` | iOS + postmarketOS boot image: `bundle` (Image, DTB with memory/bootargs/initrd placeholders, initramfs), `combine`, `extract`, `check`, `cmdline`; a copy is the pmOS device package's `/usr/bin/axon7-dualboot` (keep them in sync) |
+| `tools/axon7-dualboot-flash.sh [BUNDLE]` | from TWRP: add postmarketOS (default: from pmbootstrap's chroot) to the boot partition, iOS half kept |
 | `tools/axon7-krw-stub.sh` | build `axon7-libkrw0-plugin-stub` (Provides `libkrw0-plugin`; without it apt refuses every install) |
 | `tools/sweet-log-pull.sh` | kernel log ring from the end of `userdata` |
 
@@ -102,6 +105,31 @@ Root editing cycle: `axon7-pullroot.sh` (phone in TWRP) -> edit with
 `axon7-root-add.sh` / `axon7-jailbreak.sh` -> `axon7-flashroot.sh` (delta, seconds).
 Shut iOS down with "slide to power off" when possible; after a forced reset
 pull with `--allow-dirty` and replay the journal first.
+
+## Dual boot (iOS + postmarketOS)
+
+One boot.img: the kernel slot is the iOS loader shim + XNU payload (+ the
+stock DTBs ZTE LK selects and patches), the ramdisk slot a postmarketOS
+bundle (`AX7PMOS1`: header, mainline DTB with /memory, bootargs and 8-byte
+`linux,initrd-start/end` placeholders, initramfs, raw arm64 Image last and
+2 MiB aligned), loaded by LK at 0x98000000 (clear of LK's scratch and of
+mainline's reserved memory). The shim reads Volume Down (PM8994 GPIO 3
+RT_STS over the SPMI observer channel) for 0.5 s after it starts; held, it
+finds the bundle through LK's /chosen initrd-start/end, fills the initrd
+placeholders, moves the Image up to a 2 MiB boundary if LK placed the
+bundle unaligned, zeroes its BSS and enters Linux (x0 = DTB, MMU/D-cache
+off, I-cache invalidated, DAIF masked). Any error is shown and iOS boots
+4 s later. Hold Volume Down **after** the ZTE logo appears (at power-on
+this LK may enter its factory mode).
+
+Keeping both: `tools/axon7-cycle.sh` keeps the phone's bundle when it writes
+a new iOS kernel (`KEEP_PMOS=0` drops it, `PMOS_BUNDLE=F` installs F);
+postmarketOS has `deviceinfo_flash_kernel_on_update="false"` and rebuilds
+its half on the phone (`/usr/libexec/axon7-dualboot-update`, from the /boot
+apk trigger and an OpenRC service at boot; it refuses a boot partition
+without the iOS shim). Sizes: iOS 7.5 MB + bundle 45.8 MB = 52.8 of 64 MiB.
+Host test of `pmos.c`/`fdt.c` against a real bundle: aligned, two
+misaligned placements, four damaged bundles.
 
 ## To do
 

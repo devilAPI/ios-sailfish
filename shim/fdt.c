@@ -1,6 +1,8 @@
 /*
  * Just enough flattened-device-tree parsing to find what ABL put in
- * /chosen (initrd location). Big-endian, 4-byte aligned tokens.
+ * /chosen (initrd location), and to fill in a /chosen u64 that already
+ * exists with 8 bytes (the postmarketOS bundle's initrd placeholders).
+ * Big-endian, 4-byte aligned tokens.
  */
 #include "fdt.h"
 
@@ -36,7 +38,8 @@ static uintptr_t skip_str(uintptr_t p)
 	return p + 1;
 }
 
-int fdt_chosen_u64(uintptr_t fdt, const char *prop, uint64_t *out)
+/* Address and length of property `prop` of /chosen; 0 if absent. */
+static int fdt_chosen_prop(uintptr_t fdt, const char *prop, uintptr_t *val, uint32_t *len)
 {
 	if (!fdt || be32(fdt) != FDT_MAGIC)
 		return 0;
@@ -61,18 +64,14 @@ int fdt_chosen_u64(uintptr_t fdt, const char *prop, uint64_t *out)
 			depth--;
 			break;
 		case FDT_PROP: {
-			uint32_t len = be32(p), nameoff = be32(p + 4);
-			uintptr_t val = p + 8;
+			uint32_t l = be32(p), nameoff = be32(p + 4);
+			uintptr_t v = p + 8;
 			if (in_chosen && streq((const char *)(strings + nameoff), prop)) {
-				if (len == 4)
-					*out = be32(val);
-				else if (len == 8)
-					*out = (uint64_t)be32(val) << 32 | be32(val + 4);
-				else
-					return 0;
+				*val = v;
+				*len = l;
 				return 1;
 			}
-			p = align4(val + len);
+			p = align4(v + l);
 			break;
 		}
 		case FDT_NOP:
@@ -81,4 +80,31 @@ int fdt_chosen_u64(uintptr_t fdt, const char *prop, uint64_t *out)
 			return 0;
 		}
 	}
+}
+
+int fdt_chosen_u64(uintptr_t fdt, const char *prop, uint64_t *out)
+{
+	uintptr_t val;
+	uint32_t len;
+	if (!fdt_chosen_prop(fdt, prop, &val, &len))
+		return 0;
+	if (len == 4)
+		*out = be32(val);
+	else if (len == 8)
+		*out = (uint64_t)be32(val) << 32 | be32(val + 4);
+	else
+		return 0;
+	return 1;
+}
+
+int fdt_chosen_set_u64(uintptr_t fdt, const char *prop, uint64_t v)
+{
+	uintptr_t val;
+	uint32_t len;
+	if (!fdt_chosen_prop(fdt, prop, &val, &len) || len != 8)
+		return 0;
+	/* property values are only 4-byte aligned: two 32-bit stores */
+	*(volatile uint32_t *)val = __builtin_bswap32((uint32_t)(v >> 32));
+	*(volatile uint32_t *)(val + 4) = __builtin_bswap32((uint32_t)v);
+	return 1;
 }
