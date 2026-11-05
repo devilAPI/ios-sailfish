@@ -2,9 +2,9 @@
 
 Status (2026-11-05): **iOS 16.7.16 boots to the lock screen and home screen
 on the Axon 7, GPU-accelerated, unlocks with Volume Down (Home), touch works,
-rootless jailbreak with Sileo pre-installed, Wi-Fi works** (WPA2-PSK
-join on the first try, DHCP, Safari; 20 min connected without a firmware
-crash since patch 0192; see To do for the heavy-load test).
+rootless jailbreak with Sileo pre-installed.** Wi-Fi joins WPA2-PSK
+networks; internet worked once (0191, until a firmware crash) and not
+with 0192 (no DHCP address); 0193 is under test (see To do).
 
 | Area | State on the Axon 7 |
 | --- | --- |
@@ -14,7 +14,7 @@ crash since patch 0192; see To do for the heavy-load test).
 | Clocks | DDR 1804 MHz, CPU 1228/1363 MHz (`sweetddr=1804`, `sweetclk` on) |
 | Storage | iOS root = journaled HFS+ in `userdata`, read-write |
 | Touch / keys | Synaptics RMI4 F12 (1439x2559, IRQ), Power, Volume Up, Volume Down = Home |
-| Wi-Fi | QCA6174 with the phone's own firmware (HTT 3.28): scan, WPA2-PSK join (4/4 on the management path), DHCP, Safari; 20 min stable with 0192 |
+| Wi-Fi | QCA6174 with the phone's own firmware (HTT 3.28): scan, WPA2-PSK join (4/4 on the management path), DHCP + Safari once (0191, firmware crash under load), no DHCP with 0192, 0193 testing |
 | Jailbreak | Procursus rootless bootstrap (`/var/jb`, CF 1900) + Sileo 2.5.1, set up on first boot by a launchd job |
 | Shutdown | power off / restart through PSCI with PMIC PS_HOLD config (patch 0190) |
 
@@ -67,7 +67,8 @@ branch `axon7`). The iOS root uses `tools/mkiosroot.sh` (needs apfs-fuse, hfspro
 | 0189 | Wi-Fi: answer a repeated EAPOL 3/4 before installing keys |
 | 0190 | power off / restart: UFS cache flush, PM8994 PS_HOLD type, PSCI SYSTEM_OFF/RESET |
 | 0191 | Wi-Fi: EAPOL 4/4 resent on the management path when the data path stalls (the AP takes it: connects) |
-| 0192 | Wi-Fi: tx msdu ids tracked per slot (never reuse one the firmware holds), rx ring refilled by buffer address (out-of-order release), 4/4 only on the management path, firmware crash dump (`hi_failure_state`): 4/4 taken on the first try, 20 min connected, no crash |
+| 0192 | Wi-Fi: tx msdu ids tracked per slot (never reuse one the firmware holds), rx ring refilled by buffer address (out-of-order release), 4/4 only on the management path, firmware crash dump (`hi_failure_state`): 4/4 taken on the first try and no crash in 20 min, but DHCP never finished |
+| 0193 | Wi-Fi: 4/4 on the data path again before the management-path copy (0191 order); diagnostics: tx completion status counts, rx to us vs group, DHCP packets (testing) |
 
 Boot-args in use (`research/axon7/bootargs-*.txt`, 418 of 608 bytes):
 
@@ -102,7 +103,7 @@ pull with `--allow-dirty` and replay the journal first.
 
 ## To do
 
-- **Wi-Fi**: firmware (own `qwlan30.bin`, HTT 3.28, OTP board id 0 -> `bdwlan30.bin`), PCIe INTA (SPI 244), scan, auth, assoc, 4-way handshake and traffic work. EAPOL 4/4 on the data path never completes and the AP never takes it (50 tries); the same frame on the management path (ext tid 17) it takes (0191, 0192). With 0191 the firmware crashed (`fw_ind` 0x3, CE 4 stuck) after ~850 tx / 1300 rx frames; 0192 fixes two host bugs that can do that (msdu id reuse, rx ring buffers handed back while the firmware still held them) and prints the firmware's crash dump if it happens again. With 0192: 20 min connected, 4.5k rx / 425 tx frames, peak ~250 rx frames per 10 s, no crash; the 0191 crash came at ~900 per 10 s (Sileo refresh), not yet repeated with 0192. Open: restart the firmware and rejoin after a crash instead of staying offline.
+- **Wi-Fi**: firmware (own `qwlan30.bin`, HTT 3.28, OTP board id 0 -> `bdwlan30.bin`), PCIe INTA (SPI 244), scan, auth, assoc, 4-way handshake and traffic work. EAPOL 4/4 on the data path never completes and the AP never takes it (50 tries); the same frame on the management path (ext tid 17) it takes (0191, 0192). With 0191 the firmware crashed (`fw_ind` 0x3, CE 4 stuck) after ~850 tx / 1300 rx frames; 0192 fixes two host bugs that can do that (msdu id reuse, rx ring buffers handed back while the firmware still held them) and prints the firmware's crash dump if it happens again. With 0192 (4/4 only on the management path) the link stayed up 20 min without a crash and broadcasts arrived, but iOS never got a DHCP address; 0191 (data-path 4/4 first, held by the firmware until the keys were in) had a working data path, so 0193 restores that order and logs the data path. Open: restart the firmware and rejoin after a crash instead of staying offline.
 - **Logs**: the log ring restarts at offset 0 every boot; bytes past the current boot's `total` in `*-ring.txt.bin` are the tail of the previous, longer boot (the 0191 Wi-Fi result was found there).
 - **Dual boot with postmarketOS**: pmOS rootfs on microSD; a shim boot menu (volume key) to start either XNU or Linux.
 - **Dynamic GPU clock**: 600 MHz only while animating (600 fixed runs warm; the driver has 300/400/600 only, 510/560 need mmpll9).
