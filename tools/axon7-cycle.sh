@@ -9,7 +9,7 @@
 # Android with: adb push backup/stock-lineage-boot.img /tmp/ && adb shell dd
 # if=/tmp/stock-lineage-boot.img of=/dev/block/bootdevice/by-name/boot
 #
-# Usage: tools/axon7-cycle.sh KERNEL NAME ["BOOT-ARGS"] [WAIT_SECS]
+# Usage: tools/axon7-cycle.sh KERNEL NAME ["BOOT-ARGS"] [WAIT_SECS]   (WAIT_SECS 0: verify the write, reboot, do not wait)
 set -euo pipefail
 kernel=$(realpath "$1") name=$2
 args=${3:-debug=0xc serial=3 cpus=1 keepsyms=1 -noprogress rd=ufsroot0 wdt=-1 sweetclk=0 sweetcharge=0 sweetresetfb=0}
@@ -63,6 +63,14 @@ if [ -n "$bundle" ]; then
 fi
 adb push "$out/boot.img" /tmp/axon7-boot.img >/dev/null
 adb shell 'dd if=/tmp/axon7-boot.img of=/dev/block/bootdevice/by-name/boot bs=1M 2>&1 && sync' | grep -v tzdata
+if [ "$wait_s" = 0 ]; then
+	size=$(stat -c %s "$out/boot.img")
+	adb exec-out "dd if=/dev/block/bootdevice/by-name/boot bs=4096 count=$((size / 4096)) 2>/dev/null" | cmp - "$out/boot.img" ||
+		{ echo "boot partition does not read back as written: do not reboot, write it again" >&2; exit 1; }
+	echo "boot partition written and verified ($name), rebooting"
+	adb reboot
+	exit 0
+fi
 echo "boot partition written ($name), rebooting; waiting up to ${wait_s}s for TWRP"
 adb reboot
 sleep 20
