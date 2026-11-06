@@ -48,7 +48,7 @@
  	printf("SAILFISH WLAN: chip in reset: clkreq in %u, wake in %u\n", rd(wl_clkreq, 4) & 1u, rd(wl_wake, 4) & 1u);
 --- /dev/null
 +++ b/bsd/dev/axon7_bt.c
-@@ -0,0 +1,715 @@
+@@ -0,0 +1,729 @@
 +/*
 + * ZTE Axon 7 Bluetooth, stage 1: bring up the Bluetooth half of the QCA6174
 + * ("ROME" 3.2: SoC 0x44, ROM 0x0302) on BLSP1 UART2 and test it from the
@@ -73,6 +73,8 @@
 + *            scan as a receive test.
 + * Firmware from the payload: BT-RAMPATCH = qca/rampatch_00440302.bin,
 + * BT-NVM = qca/nvm_00440302.bin (linux-firmware, as postmarketOS).
++ * Boot-arg axon7bttest=SECS (test boots only): panic SECS after the test,
++ * so the panic path (pstore, reset to recovery) brings the phone to TWRP.
 + */
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
 +#include <sys/param.h>
@@ -82,6 +84,7 @@
 +#include <machine/machine_routines.h>
 +#include <pexpert/pexpert.h>
 +#include <pexpert/device_tree.h>
++#include <kern/debug.h>
 +
 +extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 +extern kern_return_t thread_terminate(thread_t);
@@ -156,6 +159,7 @@
 +static vm_offset_t bt_gcc, bt_uart;
 +static uint8_t bt_addr[6];              /* LSB first, as the NVM and HCI carry it */
 +static bool bt_addr_set;
++static uint32_t bt_test_secs;           /* boot-arg axon7bttest: panic (-> pstore, TWRP) this long after the test */
 +
 +static inline uint32_t
 +rd(vm_offset_t b, uint32_t o)
@@ -709,6 +713,15 @@
 +	bt_test();
 +out:
 +	sweet_log_kick();
++	if (bt_test_secs) {
++		/* test boots (tools/axon7-remote-cycle.sh): back to TWRP through the panic path */
++		printf("AXON7 BT: test done, panic in %u s (axon7bttest)\n", bt_test_secs);
++		sweet_log_kick();
++		bt_msleep(bt_test_secs * 1000);
++		sweet_log_kick();
++		bt_msleep(3000);        /* the log thread writes the ring to the disk */
++		panic("AXON7 BT: test done (axon7bttest), back to recovery");
++	}
 +	thread_terminate(current_thread());
 +}
 +
@@ -753,6 +766,7 @@
 +	if (!on) {
 +		return;
 +	}
++	(void)PE_parse_boot_argn("axon7bttest", &bt_test_secs, sizeof(bt_test_secs));
 +	if (PE_parse_boot_argn("axon7btaddr", addr, sizeof(addr))) {
 +		bt_addr_set = bt_parse_addr(addr);
 +		if (!bt_addr_set) {
