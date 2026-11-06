@@ -48,7 +48,7 @@
  	printf("SAILFISH WLAN: chip in reset: clkreq in %u, wake in %u\n", rd(wl_clkreq, 4) & 1u, rd(wl_wake, 4) & 1u);
 --- /dev/null
 +++ b/bsd/dev/axon7_bt.c
-@@ -0,0 +1,1124 @@
+@@ -0,0 +1,1148 @@
 +/*
 + * ZTE Axon 7 Bluetooth, stage 1: bring up the Bluetooth half of the QCA6174
 + * ("ROME" 3.2: SoC 0x44, ROM 0x0302) on BLSP1 UART2 and test it from the
@@ -73,8 +73,8 @@
 + *            scan as a receive test.
 + * Firmware from the payload: BT-RAMPATCH = qca/rampatch_00440302.bin,
 + * BT-NVM = qca/nvm_00440302.bin (linux-firmware, as postmarketOS).
-+ * Boot-arg axon7bttest=SECS (test boots only): panic SECS after the test,
-+ * so the panic path (pstore, reset to recovery) brings the phone to TWRP.
++ * Boot-arg axon7bttest=SECS (test boots only): warm reset SECS after the test
++ * into TWRP (restart reason recovery in the PMIC and IMEM from the start).
 + */
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
 +#include <sys/param.h>
@@ -211,20 +211,50 @@
 +}
 +
 +/*
-+ * Test boots: IMEM restart reason "recovery" (0x066bf65c = 0x77665502, as
-+ * the shim and ZTE's LK use it), so any reset of this boot (the test panic,
-+ * a hang the watchdog or a forced restart ends) comes back in TWRP and not
-+ * in the boot menu, whose setting still says iOS.
++ * Test boots end in TWRP, never in the boot menu (whose setting still says
++ * iOS during a test): the restart reason "recovery" goes where ZTE's LK
++ * reads it, PM8994 PON SOFT_RB_SPARE (0x08f, bits 7:2 = reboot mode,
++ * recovery 1, as Linux qcom-pon: postmarketOS's "reboot recovery") and
++ * IMEM 0x066bf65c = 0x77665502 (as the shim). Set at the start, so a panic
++ * or a watchdog reset of this boot goes there too.
 + */
++#define PON_PPID                0x008u
++#define PON_SOFT_RB_SPARE       0x8fu
++#define PON_PS_HOLD_RESET_CTL   0x5au
++#define PON_PS_HOLD_RESET_CTL2  0x5bu
++#define PON_TYPE_WARM_RESET     1u
++
 +static void
 +bt_restart_to_recovery(void)
 +{
++	uint8_t spare = 0;
++	bool pon = sweet_pmic_read(PON_PPID, PON_SOFT_RB_SPARE, &spare) &&
++	    sweet_pmic_write(PON_PPID, PON_SOFT_RB_SPARE, (uint8_t)((spare & 0x03u) | (1u << 2)));
 +	vm_offset_t imem = bt_map(0x066bf000u, 0x1000);
 +	if (imem) {
 +		*(volatile uint32_t *)(imem + 0x65c) = 0x77665502u;
 +		__asm__ volatile ("dsb sy" ::: "memory");
 +	}
-+	printf("AXON7 BT: restart reason set to recovery (axon7bttest): %s\n", imem ? "ok" : "MAP FAILED");
++	printf("AXON7 BT: restart reason recovery (axon7bttest): PON spare %#x -> %s, IMEM %s\n",
++	    spare, pon ? "set" : "WRITE FAILED", imem ? "set" : "MAP FAILED");
++}
++
++/* The test is over: warm reset into TWRP the way the shim and Linux restart (no panic path). */
++static void
++bt_reset_to_recovery(void)
++{
++	bt_restart_to_recovery();
++	bool ps = sweet_pmic_write(PON_PPID, PON_PS_HOLD_RESET_CTL2, 0) &&
++	    (delay(100), sweet_pmic_write(PON_PPID, PON_PS_HOLD_RESET_CTL, PON_TYPE_WARM_RESET)) &&
++	    sweet_pmic_write(PON_PPID, PON_PS_HOLD_RESET_CTL2, 0x80);
++	printf("AXON7 BT: test done: PS_HOLD warm reset %s, PSCI SYSTEM_RESET\n", ps ? "set" : "NOT SET");
++	sweet_log_kick();
++	bt_msleep(3000);        /* the log thread writes the ring to the disk */
++	__asm__ volatile ("dsb sy" ::: "memory");
++	register uint64_t x0 __asm__("x0") = 0x84000009ULL;
++	__asm__ volatile ("smc #0" : "+r"(x0) : : "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9",
++	    "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "cc", "memory");
++	panic("AXON7 BT: PSCI SYSTEM_RESET returned %d (axon7bttest)", (int)x0);
 +}
 +
 +/* ---- clocks, pins, power ---- */
@@ -1012,7 +1042,7 @@
 +	uint64_t deadline = 0;
 +	if (bt_test_secs) {
 +		clock_interval_to_deadline(bt_test_secs, NSEC_PER_SEC, &deadline);
-+		printf("AXON7 BT: serial port up, test panic in %u s (axon7bttest)\n", bt_test_secs);
++		printf("AXON7 BT: serial port up, reset to TWRP in %u s (axon7bttest)\n", bt_test_secs);
 +	}
 +	for (;;) {
 +		uint8_t buf[64];
@@ -1033,10 +1063,7 @@
 +			continue;
 +		}
 +		if (deadline && mach_absolute_time() > deadline) {
-+			sweet_log_kick();
-+			bt_msleep(3000);
-+			bt_restart_to_recovery();
-+		panic("AXON7 BT: test done (axon7bttest), back to recovery");
++			bt_reset_to_recovery();
 +		}
 +		assert_wait_timeout((event_t)&bt_tty, THREAD_UNINT, 1, NSEC_PER_MSEC);
 +		(void)thread_block(THREAD_CONTINUE_NULL);
@@ -1102,14 +1129,11 @@
 +out:
 +	sweet_log_kick();
 +	if (bt_test_secs) {
-+		/* test boots (tools/axon7-remote-cycle.sh): back to TWRP through the panic path */
-+		printf("AXON7 BT: test done, panic in %u s (axon7bttest)\n", bt_test_secs);
++		/* test boots (tools/axon7-remote-cycle.sh): warm reset into TWRP */
++		printf("AXON7 BT: test done, reset to TWRP in %u s (axon7bttest)\n", bt_test_secs);
 +		sweet_log_kick();
 +		bt_msleep(bt_test_secs * 1000);
-+		sweet_log_kick();
-+		bt_msleep(3000);        /* the log thread writes the ring to the disk */
-+		bt_restart_to_recovery();
-+		panic("AXON7 BT: test done (axon7bttest), back to recovery");
++		bt_reset_to_recovery();
 +	}
 +	thread_terminate(current_thread());
 +}
