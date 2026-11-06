@@ -48,7 +48,7 @@
  	printf("SAILFISH WLAN: chip in reset: clkreq in %u, wake in %u\n", rd(wl_clkreq, 4) & 1u, rd(wl_wake, 4) & 1u);
 --- /dev/null
 +++ b/bsd/dev/axon7_bt.c
-@@ -0,0 +1,1067 @@
+@@ -0,0 +1,1068 @@
 +/*
 + * ZTE Axon 7 Bluetooth, stage 1: bring up the Bluetooth half of the QCA6174
 + * ("ROME" 3.2: SoC 0x44, ROM 0x0302) on BLSP1 UART2 and test it from the
@@ -92,6 +92,7 @@
 +#include <miscfs/devfs/devfs.h>
 +
 +extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern vm_map_address_t phystokv(uint64_t pa);
 +extern kern_return_t thread_terminate(thread_t);
 +extern bool sweet_pmic_read(uint16_t ppid, uint8_t addr, uint8_t *out);
 +extern bool sweet_pmic_write(uint16_t ppid, uint8_t addr, uint8_t val);
