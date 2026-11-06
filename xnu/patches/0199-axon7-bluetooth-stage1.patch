@@ -1,0 +1,766 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -114,6 +114,7 @@
+ bsd/dev/sweet_gpu.c			standard
+ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sailfish_wlan.c			standard
++bsd/dev/axon7_bt.c			standard
+ bsd/dev/sweet_rpm.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -55,6 +55,7 @@
+ extern void sweet_gpu_init(void);
+ extern void sweet_touch_init(void);
+ extern void sailfish_wlan_init(void);
++extern void axon7_bt_init(void);
+ extern void sweet_usb_probe(void);
+ 
+ #define REG_CAP         0x00
+@@ -666,6 +667,7 @@
+ 	sweet_perf_init();
+ 	sweet_gpu_init();
+ 	sailfish_wlan_init();
++	axon7_bt_init();
+ 	return 0;
+ }
+ 
+--- a/bsd/dev/sailfish_wlan.c
++++ b/bsd/dev/sailfish_wlan.c
+@@ -73,6 +73,9 @@
+ #define WL_PMIC_BT_EN   0x0d2u          /* PM8994 GPIO 19: bt_qca6174 qca,bt-reset-gpio */
+ #define WL_PMIC_SLEEP   0x0d1u          /* PM8994 GPIO 18: SLEEP_CLK2, the chip's 32 kHz clock */
+ 
++/* Rails, rome_vreg and the sleep clock are on, BT_EN was held low: Bluetooth may start (axon7_bt.c). */
++volatile bool sailfish_wlan_chip_powered;
++
+ /* GCC (msm-clocks-hwio-8996.h) */
+ #define GCC_PCIE_0_SLV_AXI_CBCR         0x6b008u
+ #define GCC_PCIE_0_MSTR_AXI_CBCR        0x6b00cu
+@@ -431,6 +434,7 @@
+ 		ok = sweet_pmic_write(WL_PMIC_ROME, 0x40, 0x11);        /* DT gpio@c800: vin 0, high */
+ 		printf("SAILFISH WLAN: vdd-wlan (rome_vreg) on: %s\n", ok ? "ok" : "WRITE FAILED");
+ 		wl_msleep(10);                  /* startup-delay-us 4000 */
++		sailfish_wlan_chip_powered = ok;
+ 	}
+ 	/* TWRP order: vdd-wlan on, WLAN_EN on, then the whole PCIe enable, then PERST. */
+ 	printf("SAILFISH WLAN: chip in reset: clkreq in %u, wake in %u\n", rd(wl_clkreq, 4) & 1u, rd(wl_wake, 4) & 1u);
+--- /dev/null
++++ b/bsd/dev/axon7_bt.c
+@@ -0,0 +1,715 @@
++/*
++ * ZTE Axon 7 Bluetooth, stage 1: bring up the Bluetooth half of the QCA6174
++ * ("ROME" 3.2: SoC 0x44, ROM 0x0302) on BLSP1 UART2 and test it from the
++ * kernel. Boot-arg axon7bt=1 (off by default), needs sailfishwlan=1 (the
++ * Wi-Fi driver powers the chip: rails, rome_vreg, sleep clock). Everything
++ * is logged ("AXON7 BT:").
++ *
++ * As postmarketOS's working setup (Linux hci_qca + btqca, DT blsp1_uart2
++ * "qcom,qca6174-bt", enable-gpios PM8994 GPIO 19, clock divclk4):
++ *   clocks   BLSP1 AHB (vote), UART2 core 3.6864 MHz (GPLL0 * 96/15625)
++ *   pins     TLMM 41-44 function 2 (blsp_uart2: TX, RX, CTS, RFR), 16 mA
++ *   UART     UARTDM 1.4 at 0x07570000, 8N1, 115200 (CSR divisor 2),
++ *            hardware flow control (auto RFR), polled (no interrupt)
++ *   power    PM8994 GPIO 19 (BT_EN) high after the Wi-Fi driver's chip
++ *            power step (it holds BT_EN low until then)
++ *   chip     H4: EDL version (0xFC00 0x19), rampatch and NVM as TLV
++ *            segments of 243 bytes (0xFC00 0x1E, vendor event per segment
++ *            unless the patch header's download mode skips it), the NVM
++ *            with the BD address (tag 2, boot-arg axon7btaddr), 115200
++ *            (tag 17) and no in-band sleep (tag 17 bit 7, tag 27 bit 0),
++ *            then HCI_Reset, Read_Local_Version, Read_BD_ADDR and a 4 s LE
++ *            scan as a receive test.
++ * Firmware from the payload: BT-RAMPATCH = qca/rampatch_00440302.bin,
++ * BT-NVM = qca/nvm_00440302.bin (linux-firmware, as postmarketOS).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t thread_terminate(thread_t);
++extern bool sweet_pmic_read(uint16_t ppid, uint8_t addr, uint8_t *out);
++extern bool sweet_pmic_write(uint16_t ppid, uint8_t addr, uint8_t val);
++extern void sweet_log_kick(void);
++extern volatile bool sailfish_wlan_chip_powered;
++void axon7_bt_init(void);
++
++#define BT_GCC_PA       0x00300000u
++#define BT_TLMM_PA      0x01010000u     /* one 4 KiB tile per GPIO: CFG +0 */
++#define BT_UART_PA      0x07570000u
++#define GCC_VOTE        0x52004u        /* APCS_GCC_CLOCK_BRANCH_ENA_VOTE: bit 17 BLSP1 AHB */
++#define GCC_BLSP1_AHB   0x17004u
++#define GCC_UART2_RCGR  0x1c00cu        /* CMD, CFG +4, M +8, N +0xc, D +0x10 */
++#define GCC_UART2_CBCR  0x1c004u
++#define BT_PMIC_EN      0x0d2u          /* PM8994 GPIO 19: BT_EN */
++
++/* UARTDM 1.4 (Linux msm_serial.c) */
++#define U_MR1           0x00u
++#define U_MR2           0x04u
++#define U_CSR           0x08u           /* write */
++#define U_SR            0x08u           /* read */
++#define U_CR            0x10u           /* write */
++#define U_IMR           0x14u           /* write */
++#define U_ISR           0x14u           /* read */
++#define U_IPR           0x18u
++#define U_TFWR          0x1cu
++#define U_RFWR          0x20u
++#define U_DMRX          0x34u
++#define U_DMEN          0x3cu
++#define U_NCF_TX        0x40u
++#define U_RXFS          0x50u
++#define U_TF            0x70u
++#define U_RF            0x70u
++#define SR_RX_READY     (1u << 0)
++#define SR_TX_READY     (1u << 2)
++#define SR_TX_EMPTY     (1u << 3)
++#define SR_OVERRUN      (1u << 4)
++#define ISR_TX_READY    (1u << 7)
++#define CR_RX_EN        (1u << 0)
++#define CR_TX_EN        (1u << 2)
++#define CR_RESET_RX     (1u << 4)
++#define CR_RESET_TX     (2u << 4)
++#define CR_RESET_ERR    (3u << 4)
++#define CR_RESET_BRK    (4u << 4)
++#define CR_RESET_CTS    (7u << 4)
++#define CR_RESET_STALE  (8u << 4)
++#define CR_RESET_RFR    (14u << 4)
++#define CR_PROTECT      (16u << 4)
++#define CR_STALE_EN     (80u << 4)
++#define CR_FORCE_STALE  (4u << 8)
++#define CR_RESET_TXRDY  (3u << 8)
++#define MR1_CTS_CTL     (1u << 6)
++#define MR1_RX_RDY_CTL  (1u << 7)
++#define BT_FIFO         64u
++
++/* H4 / HCI */
++#define H4_CMD          0x01u
++#define H4_ACL          0x02u
++#define H4_EVT          0x04u
++#define EV_CC           0x0eu
++#define EV_CS           0x0fu
++#define EV_LE           0x3eu
++#define EV_VENDOR       0xffu
++#define QCA_EDL         0xfc00u
++#define EDL_VER_REQ     0x19u
++#define EDL_TLV_REQ     0x1eu
++#define EDL_TLV_RES     0x04u
++#define TLV_SEG         243u
++
++static vm_offset_t bt_gcc, bt_uart;
++static uint8_t bt_addr[6];              /* LSB first, as the NVM and HCI carry it */
++static bool bt_addr_set;
++
++static inline uint32_t
++rd(vm_offset_t b, uint32_t o)
++{
++	uint32_t v = *(volatile uint32_t *)(b + o);
++	__asm__ volatile ("dmb osh" ::: "memory");
++	return v;
++}
++
++static inline void
++wr(vm_offset_t b, uint32_t o, uint32_t v)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(b + o) = v;
++}
++
++static void
++bt_msleep(uint32_t ms)
++{
++	delay(ms * 1000);
++}
++
++static vm_offset_t
++bt_map(uint64_t pa, uint32_t size)
++{
++	vm_offset_t va = ml_io_map(trunc_page_64(pa), round_page_64(size + (pa & PAGE_MASK)));
++	return va ? va + (pa & PAGE_MASK) : 0;
++}
++
++static const uint8_t *
++bt_blob(const char *name, uint32_t *len)
++{
++	DTEntry node;
++	uint64_t const *v;
++	unsigned int size;
++	if (SecureDTLookupEntry(NULL, "/chosen/memory-map", &node) != kSuccess ||
++	    SecureDTGetProperty(node, name, (void const **)&v, &size) != kSuccess || size != 16) {
++		return NULL;
++	}
++	*len = (uint32_t)v[1];
++	return (const uint8_t *)phystokv(v[0]);
++}
++
++/* ---- clocks, pins, power ---- */
++
++static bool
++bt_wait_clear(vm_offset_t b, uint32_t off, uint32_t bit, const char *what)
++{
++	for (int i = 0; i < 400; i++) {
++		if (!(rd(b, off) & bit)) {
++			return true;
++		}
++		delay(5);
++	}
++	printf("AXON7 BT: %s stuck (%#x = %#x)\n", what, off, rd(b, off));
++	return false;
++}
++
++static bool
++bt_clocks(void)
++{
++	/* BLSP1 AHB: voted branch, then its CBCR shows CLK_OFF clear */
++	wr(bt_gcc, GCC_VOTE, rd(bt_gcc, GCC_VOTE) | (1u << 17));
++	bool ok = bt_wait_clear(bt_gcc, GCC_BLSP1_AHB, 1u << 31, "BLSP1 AHB clock");
++	/*
++	 * UART2 core clock 3.6864 MHz: GPLL0 (src 1), pre-div 1 (field 1),
++	 * M/N 96/15625, D for 50 % duty, dual-edge MND mode (clk-rcg2).
++	 */
++	const uint32_t m = 96, n = 15625, d = n - m;
++	wr(bt_gcc, GCC_UART2_RCGR + 0x8, m);
++	wr(bt_gcc, GCC_UART2_RCGR + 0xc, ~(n - m) & 0xffffu);
++	wr(bt_gcc, GCC_UART2_RCGR + 0x10, ~d & 0xffffu);
++	uint32_t cfg = rd(bt_gcc, GCC_UART2_RCGR + 0x4);
++	cfg &= ~((0x1fu) | (7u << 8) | (3u << 12) | (1u << 20));
++	cfg |= 1u | (1u << 8) | (2u << 12);
++	wr(bt_gcc, GCC_UART2_RCGR + 0x4, cfg);
++	wr(bt_gcc, GCC_UART2_RCGR, rd(bt_gcc, GCC_UART2_RCGR) | 1u);        /* UPDATE */
++	ok = bt_wait_clear(bt_gcc, GCC_UART2_RCGR, 1u, "UART2 RCG update") && ok;
++	wr(bt_gcc, GCC_UART2_CBCR, rd(bt_gcc, GCC_UART2_CBCR) | 1u);
++	ok = bt_wait_clear(bt_gcc, GCC_UART2_CBCR, 1u << 31, "UART2 core clock") && ok;
++	printf("AXON7 BT: clocks: ahb cbcr %#x, rcg cmd %#x cfg %#x, uart cbcr %#x: %s\n",
++	    rd(bt_gcc, GCC_BLSP1_AHB), rd(bt_gcc, GCC_UART2_RCGR), rd(bt_gcc, GCC_UART2_RCGR + 4),
++	    rd(bt_gcc, GCC_UART2_CBCR), ok ? "on" : "FAILED");
++	return ok;
++}
++
++static void
++bt_pins(void)
++{
++	for (unsigned g = 41; g <= 44; g++) {
++		vm_offset_t t = bt_map(BT_TLMM_PA + 0x1000u * g, 0x10);
++		if (t == 0) {
++			printf("AXON7 BT: TLMM %u map failed\n", g);
++			continue;
++		}
++		uint32_t before = rd(t, 0);
++		wr(t, 0, (2u << 2) | ((16u / 2 - 1) << 6));        /* func 2 (blsp_uart2), 16 mA, no pull */
++		printf("AXON7 BT: TLMM %u cfg %#x -> %#x\n", g, before, rd(t, 0));
++	}
++}
++
++static bool
++bt_power_on(void)
++{
++	uint8_t mode = 0, vin = 0, en = 0;
++	(void)sweet_pmic_read(BT_PMIC_EN, 0x40, &mode);
++	(void)sweet_pmic_read(BT_PMIC_EN, 0x41, &vin);
++	(void)sweet_pmic_read(BT_PMIC_EN, 0x46, &en);
++	/* DT bt-en-state: output, vin-sel 2 (S4 1.8 V), pull-down; high = mode 0x11 */
++	bool ok = sweet_pmic_write(BT_PMIC_EN, 0x41, 2) && sweet_pmic_write(BT_PMIC_EN, 0x42, 4) &&
++	    sweet_pmic_write(BT_PMIC_EN, 0x40, 0x11) && sweet_pmic_write(BT_PMIC_EN, 0x46, 0x80);
++	uint8_t after = 0;
++	(void)sweet_pmic_read(BT_PMIC_EN, 0x40, &after);
++	printf("AXON7 BT: BT_EN (ppid %#x) mode %#x vin %#x en %#x -> mode %#x: %s\n",
++	    BT_PMIC_EN, mode, vin, en, after, ok ? "high" : "WRITE FAILED");
++	return ok;
++}
++
++/* ---- UART (polled) ---- */
++
++static void
++bt_uart_init(void)
++{
++	wr(bt_uart, U_CR, CR_RESET_RX);
++	wr(bt_uart, U_CR, CR_RESET_TX);
++	wr(bt_uart, U_CR, CR_RESET_ERR);
++	wr(bt_uart, U_CR, CR_RESET_BRK);
++	wr(bt_uart, U_CR, CR_RESET_CTS);
++	wr(bt_uart, U_CR, CR_RESET_RFR);
++	wr(bt_uart, U_DMEN, 0);                 /* no BAM: FIFO mode */
++	wr(bt_uart, U_IMR, 0);                  /* polled */
++	wr(bt_uart, U_MR2, (3u << 4) | (1u << 2));                              /* 8 bits, 1 stop, no parity */
++	uint32_t rfr = BT_FIFO - 12;            /* msm_startup's auto-RFR level */
++	wr(bt_uart, U_MR1, (0xffffff00u & (rfr << 2)) | (0x3fu & rfr) | MR1_CTS_CTL | MR1_RX_RDY_CTL);
++	wr(bt_uart, U_CSR, 0xee);               /* divisor 2: 3.6864 MHz / 16 / 2 = 115200 */
++	wr(bt_uart, U_IPR, 16u);                /* rx stale watermark for divisor 2 */
++	wr(bt_uart, U_RFWR, BT_FIFO * 3 / 4);
++	wr(bt_uart, U_TFWR, 10);
++	wr(bt_uart, U_CR, CR_PROTECT);
++	wr(bt_uart, U_CR, CR_TX_EN | CR_RX_EN);
++	wr(bt_uart, U_CR, CR_RESET_STALE);
++	wr(bt_uart, U_DMRX, 0xffffff);
++	wr(bt_uart, U_CR, CR_STALE_EN);
++	printf("AXON7 BT: UART mr1 %#x mr2 %#x sr %#x\n", rd(bt_uart, U_MR1), rd(bt_uart, U_MR2), rd(bt_uart, U_SR));
++}
++
++static void
++bt_wait_tx(void)
++{
++	for (unsigned t = 0; t < 500000; t++) {
++		if ((rd(bt_uart, U_SR) & SR_TX_EMPTY) || (rd(bt_uart, U_ISR) & ISR_TX_READY)) {
++			break;
++		}
++		delay(1);
++	}
++	wr(bt_uart, U_CR, CR_RESET_TXRDY);
++}
++
++static bool
++bt_write(const uint8_t *p, uint32_t n)
++{
++	while (n > 0) {
++		uint32_t chunk = n > 256 ? 256 : n;
++		bt_wait_tx();
++		wr(bt_uart, U_NCF_TX, chunk);
++		(void)rd(bt_uart, U_NCF_TX);
++		for (uint32_t i = 0; i < chunk; i += 4) {
++			uint32_t w = 0;
++			for (uint32_t k = 0; k < 4 && i + k < chunk; k++) {
++				w |= (uint32_t)p[i + k] << (8 * k);
++			}
++			unsigned t;
++			for (t = 0; t < 200000 && !(rd(bt_uart, U_SR) & SR_TX_READY); t++) {
++				delay(1);       /* CTS low: the chip holds us off */
++			}
++			if (t == 200000) {
++				printf("AXON7 BT: TX stuck (sr %#x), CTS never came\n", rd(bt_uart, U_SR));
++				return false;
++			}
++			wr(bt_uart, U_TF, w);
++		}
++		p += chunk;
++		n -= chunk;
++	}
++	return true;
++}
++
++static uint32_t bt_slop;
++static unsigned bt_slop_n;
++static unsigned bt_overruns;
++
++/* One received byte, or -1 after timeout_us (msm_poll_get_char_dm). */
++static int
++bt_getc(uint32_t timeout_us)
++{
++	for (uint32_t waited = 0;; waited += 10) {
++		if (bt_slop_n) {
++			uint8_t c = (uint8_t)(bt_slop >> (8 * (4 - bt_slop_n)));
++			bt_slop_n--;
++			return c;
++		}
++		uint32_t sr = rd(bt_uart, U_SR);
++		if (sr & SR_OVERRUN) {
++			bt_overruns++;
++			wr(bt_uart, U_CR, CR_RESET_ERR);
++		}
++		if (sr & SR_RX_READY) {
++			bt_slop = rd(bt_uart, U_RF);
++			bt_slop_n = 4;
++			continue;
++		}
++		unsigned partial = (rd(bt_uart, U_RXFS) >> 7) & 7u;
++		if (partial) {
++			wr(bt_uart, U_CR, CR_FORCE_STALE);
++			uint32_t w = rd(bt_uart, U_RF);
++			bt_slop = w << (8 * (4 - partial));     /* the first byte at the top of the window */
++			bt_slop_n = partial;
++			wr(bt_uart, U_CR, CR_RESET_STALE);
++			wr(bt_uart, U_DMRX, 0xffffff);
++			wr(bt_uart, U_CR, CR_STALE_EN);
++			continue;
++		}
++		if (waited >= timeout_us) {
++			return -1;
++		}
++		delay(10);
++	}
++}
++
++/* ---- HCI over H4 ---- */
++
++static bool
++bt_cmd_send(uint16_t op, const uint8_t *par, uint8_t len)
++{
++	uint8_t pkt[4 + 255];
++	pkt[0] = H4_CMD;
++	pkt[1] = op & 0xff;
++	pkt[2] = op >> 8;
++	pkt[3] = len;
++	for (unsigned i = 0; i < len; i++) {
++		pkt[4 + i] = par[i];
++	}
++	return bt_write(pkt, 4u + len);
++}
++
++/*
++ * The next HCI event: code, parameter length, parameters into ev[255].
++ * ACL data and stray bytes are dropped. -1 on timeout.
++ */
++static int
++bt_event(uint8_t *ev, uint8_t *len, uint32_t timeout_ms)
++{
++	for (;;) {
++		int t = bt_getc(timeout_ms * 1000);
++		if (t < 0) {
++			return -1;
++		}
++		if (t == H4_EVT) {
++			int code = bt_getc(100000), l = code < 0 ? -1 : bt_getc(100000);
++			if (l < 0) {
++				return -1;
++			}
++			for (int i = 0; i < l; i++) {
++				int c = bt_getc(100000);
++				if (c < 0) {
++					printf("AXON7 BT: event %#x cut short (%d of %d)\n", code, i, l);
++					return -1;
++				}
++				ev[i] = (uint8_t)c;
++			}
++			*len = (uint8_t)l;
++			return code;
++		}
++		if (t == H4_ACL) {
++			int h1 = bt_getc(100000), h2 = bt_getc(100000), l1 = bt_getc(100000), l2 = bt_getc(100000);
++			if (h1 < 0 || h2 < 0 || l1 < 0 || l2 < 0) {
++				return -1;
++			}
++			for (int i = 0, l = l1 | (l2 << 8); i < l; i++) {
++				(void)bt_getc(100000);
++			}
++			continue;
++		}
++		printf("AXON7 BT: stray byte %#x\n", t);
++	}
++}
++
++/* Command Complete for op: its return parameters (status first). */
++static int
++bt_cmd_cc(uint16_t op, const uint8_t *par, uint8_t len, uint8_t *ev, uint8_t *evlen, uint32_t timeout_ms)
++{
++	if (!bt_cmd_send(op, par, len)) {
++		return -1;
++	}
++	for (;;) {
++		int code = bt_event(ev, evlen, timeout_ms);
++		if (code < 0) {
++			printf("AXON7 BT: no Command Complete for %#06x\n", op);
++			return -1;
++		}
++		if (code == EV_CC && *evlen >= 3 && (ev[1] | (ev[2] << 8)) == op) {
++			return 0;
++		}
++		if (code == EV_CS && *evlen >= 4 && (ev[2] | (ev[3] << 8)) == op && ev[0] != 0) {
++			printf("AXON7 BT: %#06x status %#x\n", op, ev[0]);
++			return -1;
++		}
++	}
++}
++
++/* A QCA vendor command answered by a vendor event [cresp, rtype, data...]. */
++static int
++bt_edl(const uint8_t *par, uint8_t len, uint8_t rtype, uint8_t *ev, uint8_t *evlen, bool wait)
++{
++	if (!bt_cmd_send(QCA_EDL, par, len)) {
++		return -1;
++	}
++	if (!wait) {
++		return 0;
++	}
++	for (;;) {
++		int code = bt_event(ev, evlen, 3000);
++		if (code < 0) {
++			printf("AXON7 BT: no vendor event for EDL %#x\n", par[0]);
++			return -1;
++		}
++		if (code == EV_VENDOR && *evlen >= 2) {
++			if (ev[0] != 0x00 || ev[1] != rtype) {
++				printf("AXON7 BT: EDL %#x: cresp %#x rtype %#x\n", par[0], ev[0], ev[1]);
++				return -1;
++			}
++			return 0;
++		}
++		/* a Command Complete/Status for 0xfc00 may come too: skip it */
++	}
++}
++
++/* Events that are already waiting (Command Completes of unacked segments). */
++static void
++bt_drain(void)
++{
++	uint8_t ev[255], l;
++	while (bt_event(ev, &l, 2) >= 0) {
++	}
++}
++
++static bool
++bt_tlv_download(const char *what, const uint8_t *data, uint32_t size, uint8_t mode)
++{
++	uint8_t seg[2 + TLV_SEG], ev[255], l;
++	uint32_t off = 0, segs = 0;
++	while (off < size) {
++		uint32_t n = size - off > TLV_SEG ? TLV_SEG : size - off;
++		/* the last segment is always acknowledged (btqca qca_download_firmware) */
++		bool wait = mode == 0 || n < TLV_SEG || off + n == size;
++		seg[0] = EDL_TLV_REQ;
++		seg[1] = (uint8_t)n;
++		for (uint32_t i = 0; i < n; i++) {
++			seg[2 + i] = data[off + i];
++		}
++		if (bt_edl(seg, (uint8_t)(2 + n), EDL_TLV_RES, ev, &l, wait) < 0) {
++			printf("AXON7 BT: %s segment %u (offset %u) failed\n", what, segs, off);
++			return false;
++		}
++		if (wait && l >= 3 && ev[2] != 0) {
++			printf("AXON7 BT: %s segment %u: result %#x\n", what, segs, ev[2]);
++		}
++		if (!wait && (segs & 7) == 7) {
++			bt_drain();
++		}
++		off += n;
++		segs++;
++	}
++	bt_drain();
++	printf("AXON7 BT: %s: %u bytes in %u segments (mode %u)\n", what, size, segs, mode);
++	return true;
++}
++
++static bool
++bt_rampatch(void)
++{
++	uint32_t len = 0;
++	const uint8_t *p = bt_blob("BT-RAMPATCH", &len);
++	if (p == NULL || len < 4 + 24) {
++		printf("AXON7 BT: no BT-RAMPATCH in the payload\n");
++		return false;
++	}
++	uint32_t tl = p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t)p[3] << 24);
++	/* tlv_type_patch: total, data length, format, signature, download mode, ... */
++	uint8_t mode = p[4 + 10];
++	printf("AXON7 BT: rampatch type %u length %u, product %#x rom %#x patch %#x, download mode %u\n",
++	    tl & 0xff, tl >> 8, p[4 + 12] | (p[4 + 13] << 8), p[4 + 14] | (p[4 + 15] << 8),
++	    p[4 + 16] | (p[4 + 17] << 8), mode);
++	if ((tl & 0xff) != 1) {
++		return false;
++	}
++	return bt_tlv_download("rampatch", p, len, mode);
++}
++
++static uint8_t bt_nvm[16384];
++
++static bool
++bt_nvm_download(void)
++{
++	uint32_t len = 0;
++	const uint8_t *p = bt_blob("BT-NVM", &len);
++	if (p == NULL || len < 8 || len > sizeof(bt_nvm)) {
++		printf("AXON7 BT: no usable BT-NVM in the payload (%u bytes)\n", len);
++		return false;
++	}
++	for (uint32_t i = 0; i < len; i++) {
++		bt_nvm[i] = p[i];
++	}
++	uint32_t hdr = 0;
++	uint32_t tl = bt_nvm[0] | (bt_nvm[1] << 8) | (bt_nvm[2] << 16) | ((uint32_t)bt_nvm[3] << 24);
++	if ((tl & 0xff) == 4) {         /* enclosing header of several tag sets: the first set */
++		hdr = 4;
++		tl = bt_nvm[4] | (bt_nvm[5] << 8) | (bt_nvm[6] << 16) | ((uint32_t)bt_nvm[7] << 24);
++	}
++	if ((tl & 0xff) != 2) {
++		printf("AXON7 BT: NVM type %u, not 2\n", tl & 0xff);
++		return false;
++	}
++	uint32_t length = tl >> 8, base = hdr + 4, idx = 0, tags = 0;
++	while (idx + 12 <= length && base + idx + 12 <= len) {
++		uint8_t *t = &bt_nvm[base + idx];
++		uint16_t id = (uint16_t)(t[0] | (t[1] << 8)), tlen = (uint16_t)(t[2] | (t[3] << 8));
++		uint8_t *d = t + 12;
++		if (base + idx + 12 + tlen > len) {
++			break;
++		}
++		if (id == 2 && tlen == 6) {
++			printf("AXON7 BT: NVM address %02x:%02x:%02x:%02x:%02x:%02x%s\n",
++			    d[5], d[4], d[3], d[2], d[1], d[0], bt_addr_set ? ", replaced" : "");
++			if (bt_addr_set) {
++				for (int i = 0; i < 6; i++) {
++					d[i] = bt_addr[i];
++				}
++			}
++		} else if (id == 17 && tlen >= 3) {
++			printf("AXON7 BT: NVM tag 17 (HCI): %#x %#x %#x -> in-band sleep off, 115200\n", d[0], d[1], d[2]);
++			d[0] &= ~0x80u;
++			d[2] = 0;               /* QCA_BAUDRATE_115200 */
++		} else if (id == 27 && tlen >= 1) {
++			printf("AXON7 BT: NVM tag 27 (deep sleep): %#x -> off\n", d[0]);
++			d[0] &= ~0x01u;
++		}
++		idx += 12 + tlen;
++		tags++;
++	}
++	printf("AXON7 BT: NVM %u bytes, %u tags\n", len, tags);
++	return bt_tlv_download("NVM", bt_nvm, len, 0);
++}
++
++static void
++bt_test(void)
++{
++	uint8_t ev[255], l;
++	if (bt_cmd_cc(0x0c03, NULL, 0, ev, &l, 3000) < 0) {             /* HCI_Reset */
++		printf("AXON7 BT: HCI_Reset failed\n");
++		return;
++	}
++	printf("AXON7 BT: HCI_Reset status %#x\n", ev[3]);
++	if (bt_cmd_cc(0x1001, NULL, 0, ev, &l, 1000) == 0 && l >= 12) {  /* Read_Local_Version */
++		printf("AXON7 BT: HCI version %u rev %#x, LMP %u subversion %#x, manufacturer %u\n",
++		    ev[4], ev[5] | (ev[6] << 8), ev[7], ev[10] | (ev[11] << 8), ev[8] | (ev[9] << 8));
++	}
++	if (bt_cmd_cc(0x1009, NULL, 0, ev, &l, 1000) == 0 && l >= 10) {  /* Read_BD_ADDR */
++		printf("AXON7 BT: BD address %02x:%02x:%02x:%02x:%02x:%02x\n",
++		    ev[9], ev[8], ev[7], ev[6], ev[5], ev[4]);
++	}
++	/* LE scan 4 s: passive, 100 ms interval/window, public address, accept all */
++	static const uint8_t scan_par[7] = { 0x00, 0xa0, 0x00, 0xa0, 0x00, 0x00, 0x00 };
++	static const uint8_t ev_mask[8] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x3f };
++	static const uint8_t le_mask[8] = { 0x1f, 0, 0, 0, 0, 0, 0, 0 };
++	static const uint8_t on[2] = { 1, 0 }, off[2] = { 0, 0 };
++	(void)bt_cmd_cc(0x0c01, ev_mask, 8, ev, &l, 1000);              /* Set_Event_Mask (LE meta on) */
++	(void)bt_cmd_cc(0x2001, le_mask, 8, ev, &l, 1000);              /* LE_Set_Event_Mask */
++	if (bt_cmd_cc(0x200b, scan_par, 7, ev, &l, 1000) < 0 || bt_cmd_cc(0x200c, on, 2, ev, &l, 1000) < 0) {
++		printf("AXON7 BT: LE scan did not start\n");
++		return;
++	}
++	unsigned reports = 0, other = 0;
++	uint64_t end, now;
++	clock_interval_to_deadline(4, NSEC_PER_SEC, &end);
++	do {
++		int code = bt_event(ev, &l, 100);
++		if (code == EV_LE && l >= 1 && ev[0] == 0x02) {
++			reports += l >= 2 ? ev[1] : 1;
++		} else if (code >= 0) {
++			other++;
++		}
++		now = mach_absolute_time();
++	} while (now < end);
++	(void)bt_cmd_cc(0x200c, off, 2, ev, &l, 1000);
++	printf("AXON7 BT: LE scan 4 s: %u advertising reports, %u other events, %u UART overruns\n",
++	    reports, other, bt_overruns);
++}
++
++static void
++bt_thread(void *arg __unused, wait_result_t wr_ __unused)
++{
++	/* the Wi-Fi driver powers the chip and holds BT_EN low until its chip step is done */
++	for (unsigned i = 0; i < 600 && !sailfish_wlan_chip_powered; i++) {
++		bt_msleep(100);
++	}
++	if (!sailfish_wlan_chip_powered) {
++		printf("AXON7 BT: the Wi-Fi driver never powered the chip (sailfishwlan=1?): not starting\n");
++		goto out;
++	}
++	bt_gcc = bt_map(BT_GCC_PA, 0x80000);
++	bt_uart = bt_map(BT_UART_PA, 0x1000);
++	if (bt_gcc == 0 || bt_uart == 0) {
++		printf("AXON7 BT: map failed\n");
++		goto out;
++	}
++	if (!bt_clocks()) {
++		goto out;
++	}
++	bt_pins();
++	bt_uart_init();
++	if (!bt_power_on()) {
++		goto out;
++	}
++	bt_msleep(150);
++	sweet_log_kick();
++
++	uint8_t ev[255], l;
++	static const uint8_t ver_req[1] = { EDL_VER_REQ };
++	int tries;
++	for (tries = 0; tries < 3; tries++) {
++		if (bt_edl(ver_req, 1, EDL_VER_REQ, ev, &l, true) == 0 && l >= 2 + 12) {
++			break;
++		}
++		bt_msleep(100);
++	}
++	if (tries == 3) {
++		printf("AXON7 BT: no answer to the version request (sr %#x, rxfs %#x)\n",
++		    rd(bt_uart, U_SR), rd(bt_uart, U_RXFS));
++		goto out;
++	}
++	const uint8_t *v = ev + 2;
++	printf("AXON7 BT: QCA product %#x, patch %#x, ROM %#x, SoC %#x\n",
++	    v[0] | (v[1] << 8) | (v[2] << 16) | ((uint32_t)v[3] << 24), v[4] | (v[5] << 8),
++	    v[6] | (v[7] << 8), v[8] | (v[9] << 8) | (v[10] << 16) | ((uint32_t)v[11] << 24));
++	sweet_log_kick();
++	if (!bt_rampatch() || !bt_nvm_download()) {
++		goto out;
++	}
++	sweet_log_kick();
++	bt_test();
++out:
++	sweet_log_kick();
++	thread_terminate(current_thread());
++}
++
++/* "18:68:6a:ee:7c:37" -> bt_addr LSB first */
++static bool
++bt_parse_addr(const char *s)
++{
++	uint8_t a[6];
++	for (int i = 0; i < 6; i++) {
++		unsigned v = 0;
++		for (int k = 0; k < 2; k++) {
++			char c = *s++;
++			v <<= 4;
++			if (c >= '0' && c <= '9') {
++				v |= (unsigned)(c - '0');
++			} else if (c >= 'a' && c <= 'f') {
++				v |= (unsigned)(c - 'a' + 10);
++			} else if (c >= 'A' && c <= 'F') {
++				v |= (unsigned)(c - 'A' + 10);
++			} else {
++				return false;
++			}
++		}
++		if (i < 5 && *s++ != ':') {
++			return false;
++		}
++		a[5 - i] = (uint8_t)v;
++	}
++	for (int i = 0; i < 6; i++) {
++		bt_addr[i] = a[i];
++	}
++	return true;
++}
++
++void
++axon7_bt_init(void)
++{
++	int on = 0;
++	char addr[24] = "";
++	thread_t thread;
++	(void)PE_parse_boot_argn("axon7bt", &on, sizeof(on));
++	if (!on) {
++		return;
++	}
++	if (PE_parse_boot_argn("axon7btaddr", addr, sizeof(addr))) {
++		bt_addr_set = bt_parse_addr(addr);
++		if (!bt_addr_set) {
++			printf("AXON7 BT: axon7btaddr \"%s\" is not XX:XX:XX:XX:XX:XX\n", addr);
++		}
++	}
++	if (kernel_thread_start(bt_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
