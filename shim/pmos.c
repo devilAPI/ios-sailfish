@@ -50,21 +50,57 @@ static void zero64(uintptr_t dst, uint64_t n)
 		*(volatile uint64_t *)(dst + i) = 0;
 }
 
-const char *pmos_boot(uintptr_t lk_dtb)
+static uint64_t stash_rs, stash_re;	/* the bundle copy pmos_stash() made */
+
+int pmos_stash(uintptr_t lk_dtb, uintptr_t dst)
 {
 	uint64_t rs, re;
 	if (!fdt_chosen_u64(lk_dtb, "linux,initrd-start", &rs) || !fdt_chosen_u64(lk_dtb, "linux,initrd-end", &re))
+		return 0;
+	if ((rs & 7) || re <= rs || !magic_ok((const char *)rs))
+		return 0;
+	if (rs != dst)
+		move64(dst, rs, re - rs);
+	stash_rs = dst;
+	stash_re = dst + (re - rs);
+	return 1;
+}
+
+static uint64_t sum64(uintptr_t p, uint64_t n)
+{
+	uint64_t s = 0, i;
+	for (i = 0; i + 8 <= n; i += 8)
+		s += *(volatile uint64_t *)(p + i);
+	if (i < n) {	/* zero-padded tail */
+		uint64_t w = 0;
+		for (uint64_t j = 0; i + j < n; j++)
+			w |= (uint64_t)*(volatile uint8_t *)(p + i + j) << (8 * j);
+		s += w;
+	}
+	return s;
+}
+
+const char *pmos_boot(uintptr_t lk_dtb)
+{
+	uint64_t rs, re;
+	if (stash_re) {
+		rs = stash_rs;
+		re = stash_re;
+	} else if (!fdt_chosen_u64(lk_dtb, "linux,initrd-start", &rs) || !fdt_chosen_u64(lk_dtb, "linux,initrd-end", &re))
 		return "no ramdisk in /chosen";
 	con_hex2("PMOS", "lo=", rs, "hi=", re);
 	const struct pmos_hdr *h = (const struct pmos_hdr *)rs;
 	if ((rs & 7) || re <= rs || !magic_ok(h->magic))
 		return "no postmarketOS bundle in the ramdisk";
 	uint64_t len = re - rs;
-	if (h->version != PMOS_VERSION || h->hdr_size < sizeof(*h) || h->total > len ||
+	if ((h->version != 1 && h->version != PMOS_VERSION) ||
+	    h->hdr_size < (h->version == 1 ? sizeof(*h) - sizeof(h->sum) : sizeof(*h)) || h->total > len ||
 	    h->dtb_off + h->dtb_size > h->total || h->initrd_off + h->initrd_size > h->total ||
 	    h->image_off + h->image_size > h->total || (h->dtb_off & 7) || (h->image_off & 7) ||
 	    h->image_mem < h->image_size || h->image_size < 64)
 		return "bad postmarketOS bundle header";
+	if (h->version >= 2 && sum64(rs + h->hdr_size, h->total - h->hdr_size) != h->sum)
+		return "bundle checksum wrong (damaged in memory)";
 	uintptr_t dtb = rs + h->dtb_off, img = rs + h->image_off;
 	if (*(volatile uint32_t *)dtb != FDT_MAGIC_BE)
 		return "bundle DTB has no FDT magic";

@@ -112,8 +112,11 @@ One boot.img: the kernel slot is the iOS loader shim + XNU payload (+ the
 stock DTBs ZTE LK selects and patches), the ramdisk slot a postmarketOS
 bundle (`AX7PMOS1`: header, mainline DTB with /memory, bootargs and 8-byte
 `linux,initrd-start/end` placeholders, initramfs, raw arm64 Image last and
-2 MiB aligned), loaded by LK at 0x98000000 (clear of LK's scratch and of
-mainline's reserved memory). The shim shows a boot menu (`boot_menu()` in
+2 MiB aligned). ZTE LK ignores the header's ramdisk address (0x98000000)
+and loads it right after its DTB, about 0x82600000, on top of the splash
+framebuffer, so the shim copies it to 0xa0000000 before it draws anything
+(`pmos_stash`, free RAM in mainline's map; a v2 bundle carries a word sum
+the shim checks before it starts Linux). The shim shows a boot menu (`boot_menu()` in
 `shim/axon7.c`): **Vol+/Vol- move the highlight, Power starts the entry**,
 iOS after 10 s without a key (`MENU_SECS`). Keys are read over the SPMI
 observer channel (PM8994 PON INT_RT_STS bit 0 for Power, GPIO 2/3 RT_STS

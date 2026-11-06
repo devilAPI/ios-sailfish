@@ -49,6 +49,12 @@ static void delay_ms(unsigned ms)
  * DTB at 0x82400000 (probe 1), so the Image + payload must stay below ~35 MB.
  */
 #define TAGS_ADDR	0x82400000UL	/* where ZTE LK puts the DTB (probe 1) */
+/*
+ * postmarketOS bundle copy: free RAM in mainline's msm8996 map (reserved
+ * memory ends below 0x92000000, ramoops at 0xbfc00000), clear of the shim,
+ * the XNU payload and LK's DTB; iOS reuses it as ordinary memory.
+ */
+#define PMOS_STASH	0xa0000000UL
 
 extern char _end[];
 
@@ -179,6 +185,9 @@ void shim_main(uint64_t dtb)
 	plog_hex("WDT_BITE", wdt_bite);
 	plog_hex("DTB", dtb);
 	plog_hex("PAYLOAD", (uintptr_t)_end);
+
+	/* before the first pixel: the bundle lies on the framebuffer */
+	plog_hex("PMOS stash", (uint32_t)pmos_stash(dtb, PMOS_STASH));
 
 	con_clear(0);
 	con_str("SHIM", "axon7 (ailsa_ii) loader");

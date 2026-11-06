@@ -7,7 +7,8 @@ bundle. The shim's boot menu (Vol+/Vol- choose, Power starts, iOS after
 10 s) starts Linux from the bundle (shim/pmos.c) or iOS as before.
 
 Bundle (little-endian header, struct pmos_hdr in shim/pmos.h):
-  0x0000  header, 4 KiB
+  0x0000  header, 4 KiB (v2: + 64-bit word sum of everything after it, checked
+          by the shim before it starts Linux)
   0x1000  DTB: mainline msm8996-zte-axon7 with /memory, /chosen bootargs and
           8-byte /chosen linux,initrd-start/end placeholders (fdtput)
   ...     initramfs (as built: Linux unpacks it), 4 KiB aligned
@@ -28,11 +29,12 @@ import argparse, gzip, hashlib, os, struct, subprocess, sys, tempfile, zlib
 
 PAGE = 4096
 MAGIC = b'AX7PMOS1'
-VERSION = 1
+VERSION = 2
 HDR_SIZE = 4096
-HDR_FMT = '<8sII8Q64s'
+HDR_FMT = '<8sII8Q64sQ'
+HDR_FMT_V1 = '<8sII8Q64s'
 SZ_2M = 2 << 20
-RAMDISK_ADDR = 0x98000000      # clear of LK's scratch (0x91c00000 or 0xa0000000) and mainline reserved memory
+RAMDISK_ADDR = 0x98000000      # header value; ZTE LK ignores it and loads the ramdisk at ~0x82600000 (the shim moves it, pmos_stash)
 BOOT_PART_MAX = 64 << 20       # sde12
 SHIM_MARK = b'AXON7 SHIM: loader'
 # Axon 7 A2017G RAM (docs/hardware.md): 2 GiB at 0x80000000, 0x7e4c0000 at 0x1_00000000
@@ -95,11 +97,18 @@ def kernel_has_shim(kernel):
 def bundle_parse(b):
     if len(b) < HDR_SIZE or b[:8] != MAGIC:
         return None
-    f = struct.unpack_from(HDR_FMT, b, 0)
+    v1 = struct.unpack_from('<I', b, 8)[0] == 1
+    f = struct.unpack_from(HDR_FMT_V1 if v1 else HDR_FMT, b, 0)
     keys = ('magic', 'version', 'hdr_size', 'dtb_off', 'dtb_size', 'initrd_off', 'initrd_size',
-            'image_off', 'image_size', 'image_mem', 'total', 'note')
+            'image_off', 'image_size', 'image_mem', 'total', 'note', 'sum')
     h = dict(zip(keys, f))
     return h
+
+
+def sum64(b):
+    """pmos.c sum64(): 64-bit LE words, zero-padded tail, mod 2^64."""
+    b = bytes(b) + b'\0' * (-len(b) % 8)
+    return sum(struct.unpack(f'<{len(b) // 8}Q', b)) & (2**64 - 1)
 
 
 def bundle_check(b):
@@ -107,8 +116,11 @@ def bundle_check(b):
     h = bundle_parse(b)
     if h is None:
         return 'no bundle magic'
-    if h['version'] != VERSION or h['hdr_size'] < struct.calcsize(HDR_FMT) or h['total'] > len(b):
+    fmt = HDR_FMT_V1 if h['version'] == 1 else HDR_FMT
+    if h['version'] not in (1, VERSION) or h['hdr_size'] < struct.calcsize(fmt) or h['total'] > len(b):
         return 'bad header (version, size or total)'
+    if h['version'] >= 2 and sum64(b[h['hdr_size']:h['total']]) != h['sum']:
+        return 'checksum wrong'
     for k in ('dtb', 'initrd', 'image'):
         if h[k + '_off'] + h[k + '_size'] > h['total']:
             return f'{k} outside the bundle'
@@ -176,12 +188,13 @@ def cmd_bundle(a):
     total = image_off + len(image)
     note = a.cmdline.encode()[:63]
     hdr = struct.pack(HDR_FMT, MAGIC, VERSION, HDR_SIZE, dtb_off, len(dtb), initrd_off, len(initrd),
-                      image_off, len(image), image_mem, total, note).ljust(HDR_SIZE, b'\0')
+                      image_off, len(image), image_mem, total, note, 0).ljust(HDR_SIZE, b'\0')
     out = bytearray(total)
     out[0:HDR_SIZE] = hdr
     out[dtb_off:dtb_off + len(dtb)] = dtb
     out[initrd_off:initrd_off + len(initrd)] = initrd
     out[image_off:image_off + len(image)] = image
+    struct.pack_into('<Q', out, struct.calcsize(HDR_FMT_V1), sum64(out[HDR_SIZE:total]))
     err = bundle_check(bytes(out))
     if err:
         die(f'built bundle fails its own check: {err}')

@@ -61,6 +61,22 @@ int main(int argc, char **argv) { if (argc < 3) return 2;
 	memcpy(c, b, n); ((struct pmos_hdr *)c)->total = n * 2; expect_err(c, n, lk, lkn, "total beyond ramdisk");
 	memcpy(c, b, n); c[((struct pmos_hdr *)c)->image_off + 56] = 0; expect_err(c, n, lk, lkn, "Image magic damaged");
 	memcpy(c, b, n); c[((struct pmos_hdr *)c)->dtb_off] = 0; expect_err(c, n, lk, lkn, "DTB magic damaged");
+	memcpy(c, b, n); c[((struct pmos_hdr *)c)->initrd_off + 12345] ^= 0x40; expect_err(c, n, lk, lkn, "initramfs byte flipped");
+	/* last: pmos_stash() state stays set. Bundle where LK put it, stashed, then drawn over (framebuffer). */
+	{
+		unsigned char *src = malloc(n + 0x1000), *dst; if (posix_memalign((void **)&dst, 2u << 20, n + (64u << 20))) fail("alloc");
+		unsigned char *rd = src + 0x800; memcpy(rd, b, n); unsigned char l2[4096]; memcpy(l2, lk, lkn);
+		fdt_chosen_set_u64((uintptr_t)l2, "linux,initrd-start", (uintptr_t)rd);
+		fdt_chosen_set_u64((uintptr_t)l2, "linux,initrd-end", (uintptr_t)rd + n);
+		if (!pmos_stash((uintptr_t)l2, (uintptr_t)dst)) fail("stash refused a good bundle");
+		memset(rd, 0xff, n);
+		const struct pmos_hdr *h = (const struct pmos_hdr *)b;
+		const char *r = pmos_boot((uintptr_t)l2);
+		if (strcmp(r, "JUMP")) { printf("  returned: %s\n", r); fail("stashed bundle did not boot"); }
+		if (got_dtb != (uintptr_t)dst + h->dtb_off) fail("stash: dtb not in the copy");
+		if (memcmp((void *)got_base, b + h->image_off, h->image_size)) fail("stash: Image damaged");
+		printf("stash: bundle copied before the original was overwritten -> ok\n");
+	}
 	printf("all host tests passed\n");
 	return 0;
 }
