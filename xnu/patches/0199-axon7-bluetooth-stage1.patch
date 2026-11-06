@@ -48,7 +48,7 @@
  	printf("SAILFISH WLAN: chip in reset: clkreq in %u, wake in %u\n", rd(wl_clkreq, 4) & 1u, rd(wl_wake, 4) & 1u);
 --- /dev/null
 +++ b/bsd/dev/axon7_bt.c
-@@ -0,0 +1,1090 @@
+@@ -0,0 +1,1124 @@
 +/*
 + * ZTE Axon 7 Bluetooth, stage 1: bring up the Bluetooth half of the QCA6174
 + * ("ROME" 3.2: SoC 0x44, ROM 0x0302) on BLSP1 UART2 and test it from the
@@ -121,6 +121,7 @@
 +#define U_TFWR          0x1cu
 +#define U_RFWR          0x20u
 +#define U_DMRX          0x34u
++#define U_RX_SNAP       0x38u
 +#define U_DMEN          0x3cu
 +#define U_NCF_TX        0x40u
 +#define U_RXFS          0x50u
@@ -303,6 +304,8 @@
 +
 +/* ---- UART (polled) ---- */
 +
++static void bt_rx_rearm(void);
++
 +static void
 +bt_uart_init(void)
 +{
@@ -313,7 +316,7 @@
 +	wr(bt_uart, U_CR, CR_RESET_CTS);
 +	wr(bt_uart, U_CR, CR_RESET_RFR);
 +	wr(bt_uart, U_DMEN, 0);                 /* no BAM: FIFO mode */
-+	wr(bt_uart, U_IMR, 0);                  /* polled */
++	wr(bt_uart, U_IMR, 1u << 3);            /* polled; RXSTALE unmasked so ISR shows it (SPI 108 is not routed) */
 +	wr(bt_uart, U_MR2, (3u << 4) | (1u << 2));                              /* 8 bits, 1 stop, no parity */
 +	uint32_t rfr = BT_FIFO - 12;            /* msm_startup's auto-RFR level */
 +	wr(bt_uart, U_MR1, (0xffffff00u & (rfr << 2)) | (0x3fu & rfr) | MR1_CTS_CTL | MR1_RX_RDY_CTL);
@@ -323,9 +326,7 @@
 +	wr(bt_uart, U_TFWR, 10);
 +	wr(bt_uart, U_CR, CR_PROTECT);
 +	wr(bt_uart, U_CR, CR_TX_EN | CR_RX_EN);
-+	wr(bt_uart, U_CR, CR_RESET_STALE);
-+	wr(bt_uart, U_DMRX, 0xffffff);
-+	wr(bt_uart, U_CR, CR_STALE_EN);
++	bt_rx_rearm();
 +	printf("AXON7 BT: UART mr1 %#x mr2 %#x sr %#x\n", rd(bt_uart, U_MR1), rd(bt_uart, U_MR2), rd(bt_uart, U_SR));
 +}
 +
@@ -373,8 +374,25 @@
 +static uint32_t bt_slop;
 +static unsigned bt_slop_n;
 +static unsigned bt_overruns;
++static uint32_t bt_rx_taken;            /* bytes read since DMRX was armed */
++static uint32_t bt_stale_left;          /* valid bytes still in the FIFO after a stale event */
 +
-+/* One received byte, or -1 after timeout_us (msm_poll_get_char_dm). */
++static void
++bt_rx_rearm(void)
++{
++	wr(bt_uart, U_CR, CR_RESET_STALE);
++	wr(bt_uart, U_DMRX, 0xffffff);
++	wr(bt_uart, U_CR, CR_STALE_EN);
++	bt_rx_taken = 0;
++}
++
++/*
++ * One received byte, or -1 after timeout_us. UARTDM packs bytes into words;
++ * a word reaches the FIFO full, except at a stale event (the line idle for
++ * the stale timeout), which pushes the partial last word and latches the
++ * byte count since DMRX was armed in RX_TOTAL_SNAP (msm_handle_rx_dm). SR is
++ * read before ISR: a word present while no stale was latched is full.
++ */
 +static int
 +bt_getc(uint32_t timeout_us)
 +{
@@ -389,20 +407,36 @@
 +			bt_overruns++;
 +			wr(bt_uart, U_CR, CR_RESET_ERR);
 +		}
++		if (bt_stale_left == 0 && (rd(bt_uart, U_ISR) & (1u << 3))) {   /* RXSTALE */
++			uint32_t total = rd(bt_uart, U_RX_SNAP);
++			bt_stale_left = total > bt_rx_taken ? total - bt_rx_taken : 0;
++			if (bt_stale_left == 0) {
++				bt_rx_rearm();
++				continue;
++			}
++			sr = rd(bt_uart, U_SR);
++		}
++		if (bt_stale_left) {
++			if (!(sr & SR_RX_READY)) {
++				/* counted bytes not in the FIFO: give up on them */
++				bt_stale_left = 0;
++				bt_rx_rearm();
++				continue;
++			}
++			uint32_t n = bt_stale_left > 4 ? 4 : bt_stale_left;
++			uint32_t w = rd(bt_uart, U_RF);
++			bt_stale_left -= n;
++			bt_slop = w << (8 * (4 - n));   /* first byte at the top of the window */
++			bt_slop_n = n;
++			if (bt_stale_left == 0) {
++				bt_rx_rearm();
++			}
++			continue;
++		}
 +		if (sr & SR_RX_READY) {
 +			bt_slop = rd(bt_uart, U_RF);
 +			bt_slop_n = 4;
-+			continue;
-+		}
-+		unsigned partial = (rd(bt_uart, U_RXFS) >> 7) & 7u;
-+		if (partial) {
-+			wr(bt_uart, U_CR, CR_FORCE_STALE);
-+			uint32_t w = rd(bt_uart, U_RF);
-+			bt_slop = w << (8 * (4 - partial));     /* the first byte at the top of the window */
-+			bt_slop_n = partial;
-+			wr(bt_uart, U_CR, CR_RESET_STALE);
-+			wr(bt_uart, U_DMRX, 0xffffff);
-+			wr(bt_uart, U_CR, CR_STALE_EN);
++			bt_rx_taken += 4;
 +			continue;
 +		}
 +		if (waited >= timeout_us) {
