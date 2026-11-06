@@ -30,6 +30,17 @@ if [ -f $w/qwlan30.bin ]; then
 		[ -f "$b" ] && blobs+=(--blob "WLAN-BDF-${b##*.b}=$b")
 	done
 fi
+# Bluetooth (axon7_bt.c, boot-arg axon7bt=1): the QCA6174's rampatch and NVM
+# (linux-firmware qca/*_00440302.bin, as postmarketOS) and the phone's own
+# address (research/firmware/bt/bdaddr, from persist/.bt_nv.bin; never in git)
+b=$fw/bt
+if [ -f $b/rampatch_00440302.bin ] && [ -f $b/nvm_00440302.bin ]; then
+	blobs+=(--blob BT-RAMPATCH=$b/rampatch_00440302.bin --blob BT-NVM=$b/nvm_00440302.bin)
+	case " $args " in
+	*" axon7bt=1 "*)
+		case "$args" in *axon7btaddr=*) ;; *) [ -f $b/bdaddr ] && args="$args axon7btaddr=$(tr -d ' \n' < $b/bdaddr)" ;; esac ;;
+	esac
+fi
 # the kernel wants the microcode without its 4-byte header
 tail -c +5 $fw/gpu/a530_pm4.fw > "$out/pm4.bin"
 tail -c +5 $fw/gpu/a530_pfp.fw > "$out/pfp.bin"
@@ -41,12 +52,15 @@ size=$(stat -c %s "$out/payload")
 WDT_SECS=${WDT_SECS:-120} shim/build-axon7.sh backup/stock-lineage-boot.img loader "$out/payload"
 cp shim/out/axon7-loader.img "$out/boot.img"
 
-[ "$(adb get-state 2>/dev/null)" = recovery ] || { echo "phone is not in TWRP (adb recovery)" >&2; exit 1; }
+# BUILD_ONLY=1: stop after $out/boot.img (tools/axon7-remote-cycle.sh flashes it
+# through TWRP without adb; it passes PMOS_BUNDLE or KEEP_PMOS=0)
+build_only=${BUILD_ONLY:-0}
+[ "$build_only" = 1 ] || [ "$(adb get-state 2>/dev/null)" = recovery ] || { echo "phone is not in TWRP (adb recovery)" >&2; exit 1; }
 # Dual boot: keep the postmarketOS bundle the phone's boot partition carries
 # (tools/axon7-dualboot.py; picked in the shim boot menu), or put in
 # PMOS_BUNDLE=FILE; KEEP_PMOS=0 writes iOS alone.
 bundle=${PMOS_BUNDLE:-}
-if [ -z "$bundle" ] && [ "${KEEP_PMOS:-1}" = 1 ]; then
+if [ -z "$bundle" ] && [ "${KEEP_PMOS:-1}" = 1 ] && [ "$build_only" != 1 ]; then
 	adb exec-out 'dd if=/dev/block/bootdevice/by-name/boot bs=1M 2>/dev/null' > "$out/boot-before.img"
 	rc=0
 	python3 -I tools/axon7-dualboot.py extract "$out/boot-before.img" -o "$out/pmos.bundle" 2>/dev/null || rc=$?
@@ -60,6 +74,10 @@ if [ -n "$bundle" ]; then
 	python3 -I tools/axon7-dualboot.py combine "$out/boot.img" "$bundle" -o "$out/boot-dual.img"
 	python3 -I tools/axon7-dualboot.py check "$out/boot-dual.img" >/dev/null
 	mv "$out/boot-dual.img" "$out/boot.img"
+fi
+if [ "$build_only" = 1 ]; then
+	echo "built $out/boot.img ($(stat -c %s "$out/boot.img") bytes)"
+	exit 0
 fi
 adb push "$out/boot.img" /tmp/axon7-boot.img >/dev/null
 adb shell 'dd if=/tmp/axon7-boot.img of=/dev/block/bootdevice/by-name/boot bs=1M 2>&1 && sync' | grep -v tzdata
