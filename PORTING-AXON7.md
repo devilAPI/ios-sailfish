@@ -138,6 +138,49 @@ without the iOS shim). Sizes: iOS 7.5 MB + bundle 45.8 MB = 52.8 of 64 MiB.
 Host test of `pmos.c`/`fdt.c` against a real bundle: aligned, two
 misaligned placements, four damaged bundles.
 
+## Bluetooth
+
+The QCA6174's Bluetooth half sits on BLSP1 UART2 (0x07570000, SPI 108,
+TLMM 41-44 function 2), BT_EN = PM8994 GPIO 19 (ppid 0x0d2), sleep clock
+and rails from the Wi-Fi driver. postmarketOS drives it with Linux
+hci_qca/btqca (ROME 3.2, SoC 0x44, ROM 0x0302, `qca/rampatch_00440302.bin`
++ `qca/nvm_00440302.bin`); the factory address is in persist
+`/.bt_nv.bin` (NV item 1, LSB first).
+
+**Stage 1 (patch 0199, `axon7bt=1`)**: `bsd/dev/axon7_bt.c` brings the
+chip up from the kernel as btqca does: clocks (BLSP1 AHB vote, UART2 core
+3.6864 MHz from GPLL0), pins, polled UARTDM 1.4 at 115200 with hardware
+flow control, BT_EN after the Wi-Fi driver's chip power step
+(`sailfish_wlan_chip_powered`), EDL version, rampatch + NVM (address from
+`axon7btaddr`, 115200, no in-band/deep sleep), HCI_Reset, version, address,
+4 s LE scan. Payload blobs BT-RAMPATCH / BT-NVM and the address come from
+`research/firmware/bt/` (`tools/axon7-cycle.sh`). Test boots:
+`axon7bttest=SECS` panics SECS after the test, which returns to TWRP;
+`tools/axon7-remote-cycle.sh` runs such a boot from postmarketOS without
+USB (TWRP OpenRecoveryScripts flash, collect the logs and restore).
+
+**Stage 2 (plan)**: iOS 16 on the iPhone 8 boots a Broadcom BCM4357 over
+UART: bluetoothd asks BlueTool (Mach service `com.apple.BlueTool`, built-in
+scripts: `power on`, `device -D -S`, `bcm -w` = .hcd download through
+0xFC2E/0xFC4C/0xFC4E, `bcm -b`/`-s` baud and sleep mode, `hci reset`), then
+opens `/dev/cu.bluetooth` (or `/dev/uart.bluetooth`) itself and speaks H4;
+power and reset go through `AppleBluetoothModule` (`AppleBTMgmt` user
+client: power on/off/sleep). The plan keeps Apple's userspace unchanged:
+1. a tty (`cu.bluetooth`/`uart.bluetooth`) on the stage-1 UART, chip
+   already booted with the QCA firmware;
+2. a Broadcom personality in that transport: the Broadcom vendor commands
+   of the boot script are answered with a synthetic Command Complete and
+   never reach the QCA chip (its own vendor commands are 0xFC00/0xFC0B);
+   standard HCI passes through;
+3. an `AppleBluetoothModule` service with the `AppleBTMgmt` methods BlueTool
+   and bluetoothd call (power on/off as BT_EN, sleep as no-ops);
+4. ADT: a `bluetooth` node under a `uart1` like the iPhone 8
+   (`bluetooth,n88`, transport speed/encoding) and `mac-address-bluetooth0`
+   = the factory address.
+Unknown until tried: which Broadcom-only commands bluetoothd itself sends
+after boot (coex, sleep, AFH) and whether it accepts manufacturer 29
+(Qualcomm) in Read_Local_Version or needs Broadcom's 15.
+
 ## To do
 
 - **Wi-Fi reconnect**: the first join of a boot works (0193: DHCP DISCOVER/OFFER/REQUEST/ACK to the radio's own MAC, 18.8k tx all completed OK, 27k rx, Sileo refresh, no firmware crash). After wifid asks to leave and joins again (Forget network, Private Address toggle, Wi-Fi off/on) the join succeeds but iOS hands down no frame at all: configd never restarts DHCP. Next: wifid/configd logs over SSH (`log stream`) while reproducing. Older notes: 4/4 on the data path never completes during the handshake (the firmware holds it until the keys are in) and the AP takes the management-path copy; without the data-path copy (0192) the data path stays dead. Private Wi-Fi Address is on in iOS but not applied (no setHardwareAddress), the AP answers the hardware MAC.
