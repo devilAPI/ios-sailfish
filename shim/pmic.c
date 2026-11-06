@@ -14,8 +14,11 @@
 #define SPMI_APIDS	256u
 #define NO_APID		0xffffu
 
-#define PM8994_GPIO3	0x0c2u		/* SID 0 GPIO n: peripheral 0xc0 + n - 1 */
-#define GPIO_RT_STS	0x10u		/* bit 0: pin level */
+#define PM8994_PON	0x008u		/* SID 0 power-on peripheral */
+#define PON_RT_STS	0x10u		/* INT_RT_STS, bit 0: KPDPWR_N (power key down) */
+#define PM8994_GPIO2	0x0c1u		/* SID 0 GPIO n: peripheral 0xc0 + n - 1; GPIO 2 volume up */
+#define PM8994_GPIO3	0x0c2u		/* GPIO 3: volume down */
+#define GPIO_RT_STS	0x10u		/* bit 0: pin level (keys are active low) */
 
 static inline uint32_t rd32(uintptr_t a)
 {
@@ -74,10 +77,24 @@ int pmic_read(uint16_t ppid, uint8_t addr, uint8_t *out)
 	return -3;
 }
 
+int pmic_key_pressed(enum pmic_key k)
+{
+	uint8_t v;
+	switch (k) {
+	case KEY_POWER:
+		if (pmic_read(PM8994_PON, PON_RT_STS, &v) != 0)
+			return -1;
+		return v & 1u;
+	case KEY_VOLUP:
+	case KEY_VOLDOWN:
+		if (pmic_read(k == KEY_VOLUP ? PM8994_GPIO2 : PM8994_GPIO3, GPIO_RT_STS, &v) != 0)
+			return -1;
+		return (v & 1u) ? 0 : 1;
+	}
+	return -1;
+}
+
 int pmic_voldown_pressed(void)
 {
-	uint8_t v = 1;
-	if (pmic_read(PM8994_GPIO3, GPIO_RT_STS, &v) != 0)
-		return -1;
-	return (v & 1u) ? 0 : 1;
+	return pmic_key_pressed(KEY_VOLDOWN);
 }

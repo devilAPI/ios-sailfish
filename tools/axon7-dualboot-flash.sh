@@ -29,4 +29,4 @@ $tool check "$work/dual.img"
 adb push "$work/dual.img" /tmp/axon7-dual.img >/dev/null
 adb shell 'dd if=/tmp/axon7-dual.img of=/dev/block/bootdevice/by-name/boot bs=1M 2>&1 && sync && rm /tmp/axon7-dual.img' | grep -v tzdata
 size=$(stat -c %s "$work/dual.img")
-adb exec-out "dd if=/dev/block/bootdevice/by-name/boot bs=4096 count=$((size / 4096)) 2>/dev/null" | cmp - "$work/dual.img" && echo "boot partition verified: iOS + postmarketOS (hold Volume Down at boot for postmarketOS)"
+adb exec-out "dd if=/dev/block/bootdevice/by-name/boot bs=4096 count=$((size / 4096)) 2>/dev/null" | cmp - "$work/dual.img" && echo "boot partition verified: iOS + postmarketOS (boot menu: Vol+/Vol- choose, Power starts)"

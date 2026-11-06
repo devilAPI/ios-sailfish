@@ -3,8 +3,8 @@
 
 The kernel slot keeps the iOS loader shim with its XNU payload (and the stock
 DTBs ZTE LK picks and patches); the ramdisk slot carries a postmarketOS
-bundle. Holding Volume Down at boot makes the shim start Linux from the
-bundle (shim/pmos.c), otherwise it boots iOS as before.
+bundle. The shim's boot menu (Vol+/Vol- choose, Power starts, iOS after
+10 s) starts Linux from the bundle (shim/pmos.c) or iOS as before.
 
 Bundle (little-endian header, struct pmos_hdr in shim/pmos.h):
   0x0000  header, 4 KiB

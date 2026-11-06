@@ -115,6 +115,24 @@ void con_skip(void)
 	row++;
 }
 
+int con_row(void)
+{
+	return row;
+}
+
+void con_line(int r, const char *label, const char *s, uint32_t fg)
+{
+	int saved = row, col;
+	row = r;
+	col = put_str(0, label, YELLOW);
+	while (col < LABEL_COLS)
+		put_char(col++, ' ', fg);
+	col = put_str(LABEL_COLS, s, fg);
+	while (MARGIN + (col + 1) * CH_W <= FB_W)
+		put_char(col++, ' ', fg);
+	row = saved;
+}
+
 void con_str(const char *label, const char *s)
 {
 	put_str(0, label, YELLOW);

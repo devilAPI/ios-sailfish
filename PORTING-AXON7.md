@@ -17,7 +17,7 @@ crash, 0193); after a disconnect and rejoin iOS never runs DHCP again (see To do
 | Wi-Fi | QCA6174 with the phone's own firmware (HTT 3.28): scan, WPA2-PSK join (4/4 on the management path), first join of a boot: DHCP, Safari, Sileo (0193); a rejoin gets no DHCP |
 | Jailbreak | Procursus rootless bootstrap (`/var/jb`, CF 1900) + Sileo 2.5.1 + OpenSSH 9.7 (`mobile`/`root`, password `alpine`); boot job `axon7-jbinit.sh`; `axon7-libkrw0-plugin-stub` so apt resolves |
 | Shutdown | power off / restart through PSCI with PMIC PS_HOLD config (patch 0190) |
-| Dual boot | iOS by default; Volume Down held at the ZTE logo starts postmarketOS from a bundle in the boot image's ramdisk slot (shim `pmos.c`, `tools/axon7-dualboot.py`) |
+| Dual boot | Boot menu after the ZTE logo (Vol+/Vol- choose, Power starts, iOS after 10 s); postmarketOS starts from a bundle in the boot image's ramdisk slot (shim `pmos.c`, `tools/axon7-dualboot.py`) |
 
 Hardware reference for the phone: https://github.com/devilAPI/zte-axon7 (`docs/`).
 
@@ -113,14 +113,18 @@ stock DTBs ZTE LK selects and patches), the ramdisk slot a postmarketOS
 bundle (`AX7PMOS1`: header, mainline DTB with /memory, bootargs and 8-byte
 `linux,initrd-start/end` placeholders, initramfs, raw arm64 Image last and
 2 MiB aligned), loaded by LK at 0x98000000 (clear of LK's scratch and of
-mainline's reserved memory). The shim reads Volume Down (PM8994 GPIO 3
-RT_STS over the SPMI observer channel) for 0.5 s after it starts; held, it
-finds the bundle through LK's /chosen initrd-start/end, fills the initrd
+mainline's reserved memory). The shim shows a boot menu (`boot_menu()` in
+`shim/axon7.c`): **Vol+/Vol- move the highlight, Power starts the entry**,
+iOS after 10 s without a key (`MENU_SECS`). Keys are read over the SPMI
+observer channel (PM8994 PON INT_RT_STS bit 0 for Power, GPIO 2/3 RT_STS
+for Vol+/Vol-, active low) and count only after they were seen released, so
+the power-on press does nothing. For postmarketOS the shim finds the bundle through LK's /chosen initrd-start/end, fills the initrd
 placeholders, moves the Image up to a 2 MiB boundary if LK placed the
 bundle unaligned, zeroes its BSS and enters Linux (x0 = DTB, MMU/D-cache
-off, I-cache invalidated, DAIF masked). Any error is shown and iOS boots
-4 s later. Hold Volume Down **after** the ZTE logo appears (at power-on
-this LK may enter its factory mode).
+off, I-cache invalidated, DAIF masked). An error is shown under the menu,
+which comes back with iOS selected (no second postmarketOS try in that
+boot, the Image may have been moved). Holding Volume Down at power-on is not
+used: ZTE LK takes that for its factory mode before the shim runs.
 
 Keeping both: `tools/axon7-cycle.sh` keeps the phone's bundle when it writes
 a new iOS kernel (`KEEP_PMOS=0` drops it, `PMOS_BUNDLE=F` installs F);

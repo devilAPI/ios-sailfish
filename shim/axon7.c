@@ -52,6 +52,120 @@ static void delay_ms(unsigned ms)
 
 extern char _end[];
 
+/*
+ * Dual boot menu: Vol+/Vol- move the highlight, Power starts the entry.
+ * Keys count only after they were seen released, so the power-on press (or
+ * a key still held from the ZTE logo) does nothing. With no key pressed iOS
+ * starts after MENU_SECS. A failed postmarketOS start shows why and returns
+ * to the menu. Holding Volume Down at power-on is not used: ZTE LK takes
+ * that itself (FTM mode) before this code runs.
+ */
+#ifndef MENU_SECS
+#define MENU_SECS	10
+#endif
+#define POLL_MS		20
+
+enum { MENU_IOS, MENU_PMOS, MENU_N };
+static const char menu_names[MENU_N][16] = { "iOS", "postmarketOS" };	/* no pointers: no ABS64 relocs */
+
+static void menu_draw(int top, int sel, const char *status)
+{
+	for (int i = 0; i < MENU_N; i++) {
+		char line[24] = "  ";
+		const char *n = menu_names[i];
+		int j = 2;
+		if (i == sel)
+			line[0] = '>';
+		while (*n && j < (int)sizeof(line) - 1)
+			line[j++] = *n++;
+		line[j] = 0;
+		con_line(top + i, "", line, i == sel ? GREEN : WHITE);
+	}
+	con_line(top + MENU_N + 1, "", status, YELLOW);
+	con_flush();
+}
+
+static void boot_menu(uint64_t dtb)
+{
+	static const enum pmic_key keys[3] = { KEY_POWER, KEY_VOLUP, KEY_VOLDOWN };
+	int armed[3] = { 0, 0, 0 }, sel = MENU_IOS, waiting = 1, pmos_failed = 0;
+	uint64_t f = rsr("cntfrq_el0"), deadline = rsr("cntpct_el0") + f * MENU_SECS;
+	char status[40];
+
+	if (pmic_key_pressed(KEY_POWER) < 0 || pmic_key_pressed(KEY_VOLUP) < 0 ||
+	    pmic_key_pressed(KEY_VOLDOWN) < 0) {
+		plog_str("MENU: keys unreadable, iOS\n");
+		con_str("KEYS", "unreadable, booting iOS");
+		return;
+	}
+	con_str("BOOT", "Vol+/Vol- choose, Power starts");
+	con_skip();
+	int top = con_row();
+	for (int i = 0; i < MENU_N + 3; i++)	/* entries, gap, status, error line */
+		con_skip();
+
+	for (int last_s = -1;;) {
+		uint64_t now = rsr("cntpct_el0");
+		if (waiting) {
+			int left = now >= deadline ? 0 : (int)((deadline - now + f - 1) / f);
+			if (left == 0) {
+				plog_str("MENU: timeout, iOS\n");
+				return;
+			}
+			if (left != last_s) {
+				const char *a = "iOS in ";
+				int j = 0;
+				while (*a)
+					status[j++] = *a++;
+				if (left >= 10)
+					status[j++] = (char)('0' + left / 10);
+				status[j++] = (char)('0' + left % 10);
+				status[j++] = 's';
+				status[j] = 0;
+				menu_draw(top, sel, status);
+				last_s = left;
+			}
+		}
+		for (int k = 0; k < 3; k++) {
+			int p = pmic_key_pressed(keys[k]);
+			if (p == 0) {
+				armed[k] = 1;
+				continue;
+			}
+			if (p != 1 || !armed[k])
+				continue;
+			armed[k] = 0;	/* one action per press */
+			waiting = 0;
+			if (keys[k] == KEY_VOLUP) {
+				sel = (sel + MENU_N - 1) % MENU_N;
+				menu_draw(top, sel, "");
+			} else if (keys[k] == KEY_VOLDOWN) {
+				sel = (sel + 1) % MENU_N;
+				menu_draw(top, sel, "");
+			} else if (sel == MENU_IOS) {
+				plog_str("MENU: iOS\n");
+				return;
+			} else if (pmos_failed) {
+				/* pmos_boot may have moved the Image already: no second try */
+				menu_draw(top, sel, "postmarketOS failed, see below");
+			} else {
+				plog_str("MENU: postmarketOS\n");
+				menu_draw(top, sel, "starting postmarketOS");
+				const char *why = pmos_boot(dtb);
+				plog_str("PMOS: ");
+				plog_str(why);
+				plog_str("\n");
+				con_line(top + MENU_N + 2, "PMOS", why, RED);
+				pmos_failed = 1;
+				sel = MENU_IOS;
+				menu_draw(top, sel, "postmarketOS failed, choose again");
+			}
+		}
+		delay_ms(POLL_MS);
+	}
+}
+
+
 void shim_main(uint64_t dtb)
 {
 	/* The bootloader leaves the APSS watchdog running (bite 30 s after entry). */
@@ -70,30 +184,8 @@ void shim_main(uint64_t dtb)
 	con_str("SHIM", "axon7 (ailsa_ii) loader");
 	con_skip();
 
-	/*
-	 * Dual boot: Volume Down held (checked for 0.5 s, so a press during the
-	 * ZTE logo counts) starts postmarketOS from the ramdisk bundle; anything
-	 * going wrong there falls through to iOS.
-	 */
-	int vd = pmic_voldown_pressed();
-	for (int i = 0; vd == 0 && i < 50; i++) {
-		delay_ms(10);
-		vd = pmic_voldown_pressed();
-	}
-	plog_hex("VOLDOWN", (uint32_t)vd);
-	if (vd == 1) {
-		con_str("VOL-", "held: postmarketOS");
-		const char *pwhy = pmos_boot(dtb);
-		plog_str("PMOS: ");
-		plog_str(pwhy);
-		plog_str("\n");
-		con_str("PMOS", pwhy);
-		con_str("IOS", "booting iOS instead in 4s");
-		con_flush();
-		delay_ms(4000);
-	} else if (vd < 0) {
-		con_str("VOL-", "unreadable, booting iOS");
-	}
+	boot_menu(dtb);
+
 	/*
 	 * Re-arm the watchdog for the kernel (bite WDT_SECS after this): a hang
 	 * then ends in a warm reset that keeps RAM, so the kernel's early log

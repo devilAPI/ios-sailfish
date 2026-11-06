@@ -1,5 +1,5 @@
 /*
- * Volume Down at boot: postmarketOS instead of iOS. ZTE LK loads the boot
+ * Boot menu entry postmarketOS (axon7.c): Linux instead of iOS. ZTE LK loads the boot
  * image's ramdisk (the bundle) at the header's ramdisk address and records
  * it in /chosen linux,initrd-start/end of the DTB it patched (x0, 0x82400000).
  * The bundle's own DTB is mainline's msm8996-zte-axon7 with memory, bootargs

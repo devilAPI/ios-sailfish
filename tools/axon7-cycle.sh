@@ -43,7 +43,7 @@ cp shim/out/axon7-loader.img "$out/boot.img"
 
 [ "$(adb get-state 2>/dev/null)" = recovery ] || { echo "phone is not in TWRP (adb recovery)" >&2; exit 1; }
 # Dual boot: keep the postmarketOS bundle the phone's boot partition carries
-# (tools/axon7-dualboot.py; Volume Down at boot starts it), or put in
+# (tools/axon7-dualboot.py; picked in the shim boot menu), or put in
 # PMOS_BUNDLE=FILE; KEEP_PMOS=0 writes iOS alone.
 bundle=${PMOS_BUNDLE:-}
 if [ -z "$bundle" ] && [ "${KEEP_PMOS:-1}" = 1 ]; then
