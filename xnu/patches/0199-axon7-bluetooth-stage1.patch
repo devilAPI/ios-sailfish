@@ -48,7 +48,7 @@
  	printf("SAILFISH WLAN: chip in reset: clkreq in %u, wake in %u\n", rd(wl_clkreq, 4) & 1u, rd(wl_wake, 4) & 1u);
 --- /dev/null
 +++ b/bsd/dev/axon7_bt.c
-@@ -0,0 +1,729 @@
+@@ -0,0 +1,1067 @@
 +/*
 + * ZTE Axon 7 Bluetooth, stage 1: bring up the Bluetooth half of the QCA6174
 + * ("ROME" 3.2: SoC 0x44, ROM 0x0302) on BLSP1 UART2 and test it from the
@@ -85,6 +85,11 @@
 +#include <pexpert/pexpert.h>
 +#include <pexpert/device_tree.h>
 +#include <kern/debug.h>
++#include <kern/sched_prim.h>
++#include <sys/conf.h>
++#include <sys/tty.h>
++#include <sys/proc.h>
++#include <miscfs/devfs/devfs.h>
 +
 +extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 +extern kern_return_t thread_terminate(thread_t);
@@ -659,6 +664,332 @@
 +	    reports, other, bt_overruns);
 +}
 +
++/*
++ * Stage 2: the chip as a serial port for iOS's Bluetooth stack, as the
++ * iPhone 8's UART: /dev/cu.bluetooth and /dev/uart.bluetooth (bluetoothd
++ * tries both), H4 in both directions (boot-arg axon7bttty=1). A thread
++ * moves received bytes into the line discipline (the UART is polled every
++ * millisecond; auto-RFR holds the chip off while the 64-byte FIFO is full).
++ * Every HCI command out and event in is logged ("AXON7 BT: >" / "<") so a
++ * test boot shows what bluetoothd and BlueTool send. Broadcom's own vendor
++ * commands (the iPhone's BCM4357: firmware download, baud rate, sleep
++ * mode, address) never reach the QCA chip, which is booted already: they
++ * get a Command Complete with status 0 from here.
++ */
++static struct tty *bt_tty;
++static struct tty *bt_ttys[1];
++static int bt_cmajor = -1;
++static bool bt_tty_on;
++static unsigned bt_log_budget = 400;    /* logged packets per boot */
++
++/* outgoing H4 stream: one packet at a time */
++static uint8_t bt_txpkt[4 + 255 + 4];
++static unsigned bt_txlen, bt_txneed, bt_txpass;     /* bt_txpass: payload bytes of a long ACL packet still to pass */
++
++/* incoming H4 stream, only for the log */
++static uint8_t bt_rxhdr[3];
++static unsigned bt_rxlen, bt_rxskip;
++
++static const uint16_t bt_bcm_ops[] = {
++	0xfc01,         /* Write_BD_ADDR */
++	0xfc18,         /* Update_UART_Baud_Rate */
++	0xfc1c,         /* Write_SCO_PCM_Int_Param */
++	0xfc1e,         /* Write_PCM_Data_Format_Param */
++	0xfc27,         /* Write_Sleep_Mode */
++	0xfc2e,         /* Download_Minidriver */
++	0xfc45,         /* Write_UART_Clock_Setting */
++	0xfc4c,         /* Write_RAM */
++	0xfc4e,         /* Launch_RAM */
++	0xfc6d,         /* Write_I2SPCM_Interface_Param */
++};
++
++static bool
++bt_is_bcm(uint16_t op)
++{
++	for (unsigned i = 0; i < sizeof(bt_bcm_ops) / sizeof(bt_bcm_ops[0]); i++) {
++		if (bt_bcm_ops[i] == op) {
++			return true;
++		}
++	}
++	return false;
++}
++
++/* tty locked: hand bytes to the line discipline */
++static void
++bt_tty_input(const uint8_t *p, unsigned n)
++{
++	for (unsigned i = 0; i < n; i++) {
++		(*linesw[bt_tty->t_line].l_rint)(p[i], bt_tty);
++	}
++}
++
++static void
++bt_log_rx(uint8_t c)
++{
++	if (bt_rxskip) {
++		bt_rxskip--;
++		return;
++	}
++	if (bt_rxlen == 0 && c != H4_EVT) {
++		return;         /* ACL/SCO: not logged */
++	}
++	bt_rxhdr[bt_rxlen++] = c;
++	if (bt_rxlen == 3) {
++		if (bt_log_budget) {
++			bt_log_budget--;
++			printf("AXON7 BT: < event %#x len %u\n", bt_rxhdr[1], bt_rxhdr[2]);
++		}
++		bt_rxskip = bt_rxhdr[2];
++		bt_rxlen = 0;
++	}
++}
++
++/* tty locked: one complete outgoing packet */
++static void
++bt_tx_packet(void)
++{
++	if (bt_txpkt[0] == H4_CMD) {
++		uint16_t op = (uint16_t)(bt_txpkt[1] | (bt_txpkt[2] << 8));
++		bool bcm = bt_is_bcm(op);
++		if (bt_log_budget) {
++			bt_log_budget--;
++			printf("AXON7 BT: > cmd %#06x len %u%s\n", op, bt_txpkt[3], bcm ? " (Broadcom: answered here)" : "");
++		}
++		if (bcm) {
++			/* Command Complete, 1 credit, status 0 */
++			uint8_t cc[7] = { H4_EVT, EV_CC, 4, 1, (uint8_t)(op & 0xff), (uint8_t)(op >> 8), 0 };
++			bt_tty_input(cc, sizeof(cc));
++			return;
++		}
++	}
++	(void)bt_write(bt_txpkt, bt_txlen);
++}
++
++/* tty locked: H4 framing of the output queue */
++static void
++bt_tx_byte(uint8_t c)
++{
++	if (bt_txpass) {
++		(void)bt_write(&c, 1);
++		bt_txpass--;
++		return;
++	}
++	if (bt_txlen >= sizeof(bt_txpkt)) {
++		bt_txlen = 0;           /* garbage: resynchronise */
++	}
++	bt_txpkt[bt_txlen++] = c;
++	if (bt_txlen == 1) {
++		bt_txneed = c == H4_CMD ? 4 : c == H4_ACL ? 5 : c == 0x03 ? 4 : 1;
++		if (bt_txneed == 1) {
++			(void)bt_write(bt_txpkt, 1);    /* not H4: pass it on */
++			bt_txlen = 0;
++		}
++		return;
++	}
++	if (bt_txlen == bt_txneed) {
++		/* header complete: add the payload length */
++		if (bt_txpkt[0] == H4_CMD || bt_txpkt[0] == 0x03) {
++			bt_txneed += bt_txpkt[bt_txpkt[0] == H4_CMD ? 3 : 3];
++		} else {
++			unsigned l = bt_txpkt[3] | (bt_txpkt[4] << 8);
++			if (l > sizeof(bt_txpkt) - 5) {
++				/* long ACL: the header now, the payload byte by byte */
++				(void)bt_write(bt_txpkt, bt_txlen);
++				bt_txlen = 0;
++				bt_txpass = l;
++				return;
++			}
++			bt_txneed += l;
++		}
++		if (bt_txlen < bt_txneed) {
++			return;
++		}
++	}
++	if (bt_txlen >= bt_txneed && bt_txlen > 1) {
++		bt_tx_packet();
++		bt_txlen = 0;
++	}
++}
++
++static void
++bt_tty_start_output(struct tty *tp)
++{
++	if (tp->t_state & (TS_TIMEOUT | TS_BUSY | TS_TTSTOP)) {
++		goto out;
++	}
++	tp->t_state |= TS_BUSY;
++	while (tp->t_outq.c_cc > 0) {
++		uint8_t buf[64];
++		int cc = ndqb(&tp->t_outq, 0);
++		if (cc <= 0) {
++			break;
++		}
++		cc = MIN(cc, (int)sizeof(buf));
++		(void)q_to_b(&tp->t_outq, buf, cc);
++		for (int i = 0; i < cc; i++) {
++			bt_tx_byte(buf[i]);
++		}
++	}
++	tp->t_state &= ~TS_BUSY;
++out:
++	(*linesw[tp->t_line].l_start)(tp);
++}
++
++static int
++bt_tty_open(dev_t dev, __unused int flag, __unused int devtype, __unused proc_t p)
++{
++	if (minor(dev) != 0 || bt_tty == NULL) {
++		return ENXIO;
++	}
++	struct tty *tp = bt_tty;
++	tty_lock(tp);
++	tp->t_oproc = bt_tty_start_output;
++	tp->t_param = NULL;
++	tp->t_dev = dev;
++	if (!(tp->t_state & TS_ISOPEN)) {
++		tp->t_iflag = 0;
++		tp->t_oflag = 0;
++		tp->t_cflag = CREAD | CS8 | CLOCAL;
++		tp->t_lflag = 0;
++		tp->t_ispeed = tp->t_ospeed = 115200;
++		termioschars(&tp->t_termios);
++		ttsetwater(tp);
++		bt_txlen = bt_txpass = 0;
++		bt_rxlen = bt_rxskip = 0;
++	}
++	tp->t_state |= TS_CARR_ON;
++	int ret = (*linesw[tp->t_line].l_open)(dev, tp);
++	tty_unlock(tp);
++	printf("AXON7 BT: serial port opened by pid %d: %d\n", proc_selfpid(), ret);
++	return ret;
++}
++
++static int
++bt_tty_close(__unused dev_t dev, int flag, __unused int mode, __unused proc_t p)
++{
++	struct tty *tp = bt_tty;
++	tty_lock(tp);
++	int ret = (*linesw[tp->t_line].l_close)(tp, flag);
++	ttyclose(tp);
++	tty_unlock(tp);
++	printf("AXON7 BT: serial port closed\n");
++	return ret;
++}
++
++static int
++bt_tty_read(__unused dev_t dev, struct uio *uio, int ioflag)
++{
++	struct tty *tp = bt_tty;
++	tty_lock(tp);
++	int ret = (*linesw[tp->t_line].l_read)(tp, uio, ioflag);
++	tty_unlock(tp);
++	return ret;
++}
++
++static int
++bt_tty_write(__unused dev_t dev, struct uio *uio, int ioflag)
++{
++	struct tty *tp = bt_tty;
++	tty_lock(tp);
++	int ret = (*linesw[tp->t_line].l_write)(tp, uio, ioflag);
++	tty_unlock(tp);
++	return ret;
++}
++
++static int
++bt_tty_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, int flag, proc_t p)
++{
++	struct tty *tp = bt_tty;
++	tty_lock(tp);
++	int error = (*linesw[tp->t_line].l_ioctl)(tp, cmd, data, flag, p);
++	if (error == ENOTTY) {
++		error = ttioctl_locked(tp, cmd, data, flag, p);
++	}
++	if (error == ENOTTY) {
++		/* the iPhone's serial driver has more (IOSSIOSPEED etc.): accept and log */
++		printf("AXON7 BT: ioctl %#lx not handled, accepted\n", cmd);
++		error = 0;
++	}
++	tty_unlock(tp);
++	return error;
++}
++
++static const struct cdevsw bt_cdevsw = {
++	.d_open = bt_tty_open,
++	.d_close = bt_tty_close,
++	.d_read = bt_tty_read,
++	.d_write = bt_tty_write,
++	.d_ioctl = bt_tty_ioctl,
++	.d_stop = eno_stop,
++	.d_reset = eno_reset,
++	.d_ttys = bt_ttys,
++	.d_select = ttselect,
++	.d_mmap = eno_mmap,
++	.d_strategy = eno_strat,
++	.d_reserved_1 = eno_getc,
++	.d_reserved_2 = eno_putc,
++	.d_type = D_TTY,
++};
++
++static bool
++bt_tty_create(void)
++{
++	bt_tty = ttymalloc();
++	if (bt_tty == NULL) {
++		return false;
++	}
++	bt_ttys[0] = bt_tty;
++	bt_cmajor = cdevsw_add(-1, &bt_cdevsw);
++	if (bt_cmajor < 0) {
++		printf("AXON7 BT: no character major\n");
++		return false;
++	}
++	(void)cdevsw_setkqueueok(bt_cmajor, &bt_cdevsw, CDEVSW_SELECT_KQUEUE);
++	bt_tty->t_dev = makedev(bt_cmajor, 0);
++	void *a = devfs_make_node(makedev(bt_cmajor, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "cu.bluetooth");
++	void *b = devfs_make_node(makedev(bt_cmajor, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "uart.bluetooth");
++	printf("AXON7 BT: /dev/cu.bluetooth %s, /dev/uart.bluetooth %s (major %d)\n",
++	    a ? "made" : "FAILED", b ? "made" : "FAILED", bt_cmajor);
++	return a != NULL;
++}
++
++/* The receive side, forever; the test panic (axon7bttest) from here too. */
++static void
++bt_tty_loop(void)
++{
++	uint64_t deadline = 0;
++	if (bt_test_secs) {
++		clock_interval_to_deadline(bt_test_secs, NSEC_PER_SEC, &deadline);
++		printf("AXON7 BT: serial port up, test panic in %u s (axon7bttest)\n", bt_test_secs);
++	}
++	for (;;) {
++		uint8_t buf[64];
++		unsigned n = 0;
++		int c;
++		while (n < sizeof(buf) && (c = bt_getc(0)) >= 0) {
++			buf[n++] = (uint8_t)c;
++		}
++		if (n) {
++			tty_lock(bt_tty);
++			for (unsigned i = 0; i < n; i++) {
++				bt_log_rx(buf[i]);
++			}
++			if (bt_tty->t_state & TS_ISOPEN) {
++				bt_tty_input(buf, n);
++			}
++			tty_unlock(bt_tty);
++			continue;
++		}
++		if (deadline && mach_absolute_time() > deadline) {
++			sweet_log_kick();
++			bt_msleep(3000);
++			panic("AXON7 BT: test done (axon7bttest), back to recovery");
++		}
++		assert_wait_timeout((event_t)&bt_tty, THREAD_UNINT, 1, NSEC_PER_MSEC);
++		(void)thread_block(THREAD_CONTINUE_NULL);
++	}
++}
++
 +static void
 +bt_thread(void *arg __unused, wait_result_t wr_ __unused)
 +{
@@ -711,6 +1042,10 @@
 +	}
 +	sweet_log_kick();
 +	bt_test();
++	if (bt_tty_on && bt_tty_create()) {
++		sweet_log_kick();
++		bt_tty_loop();          /* never returns */
++	}
 +out:
 +	sweet_log_kick();
 +	if (bt_test_secs) {
@@ -767,6 +1102,9 @@
 +		return;
 +	}
 +	(void)PE_parse_boot_argn("axon7bttest", &bt_test_secs, sizeof(bt_test_secs));
++	int tty = 0;
++	(void)PE_parse_boot_argn("axon7bttty", &tty, sizeof(tty));
++	bt_tty_on = tty != 0;
 +	if (PE_parse_boot_argn("axon7btaddr", addr, sizeof(addr))) {
 +		bt_addr_set = bt_parse_addr(addr);
 +		if (!bt_addr_set) {
