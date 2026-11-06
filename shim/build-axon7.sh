@@ -12,7 +12,7 @@ O=out/axon7-$kind
 mkdir -p $O
 case $kind in
 probe)  srcs="start.S axon7-probe.c" ;;
-loader) srcs="start.S axon7.c pstore.c console.c fdt.c loader.c pmic.c pmos.c" ;;
+loader) srcs="start.S axon7.c pstore.c console.c fdt.c loader.c pmic.c pmos.c fdtw.c ufsr.c android.c" ;;
 *) echo "unknown kind $kind" >&2; exit 2 ;;
 esac
 objs=
@@ -27,4 +27,4 @@ llvm-objcopy -O binary $O/shim.elf $O/Image
 size=$(llvm-nm $O/shim.elf | awk '$3=="_end"{print $1}')
 truncate -s $((16#$size)) $O/Image
 [ -z "$payload" ] || cat "$payload" >> $O/Image
-../tools/mkboot-v0.sh "$stock" $O/Image out/axon7-$kind.img
+CLEAR_CMDLINE=1 ../tools/mkboot-v0.sh "$stock" $O/Image out/axon7-$kind.img

@@ -4,14 +4,17 @@
 # are kept. The kernel goes in as gzip: the sailfish aboot `fastboot boot`
 # path says "dtb not found" for LZ4 kernels, even for the unmodified stock
 # Image.lz4-dtb that boots fine from flash.
+# CLEAR_CMDLINE=1 empties the header command line (Axon 7: then the last
+# string LK puts in /chosen bootargs is only LK's own additions, which the
+# shim's LineageOS entry passes on, shim/android.c).
 # Usage: tools/mkboot-v0.sh STOCK_BOOT.img Image OUT.img
 set -euo pipefail
 stock=$1 image=$2 out=$3
 tmp=$(mktemp -d)
 gzip -9 -n -c "$image" > "$tmp/Image.gz"
-python3 -I - "$stock" "$tmp/Image.gz" "$out" <<'EOF'
+python3 -I - "$stock" "$tmp/Image.gz" "$out" "${CLEAR_CMDLINE:-0}" <<'EOF'
 import hashlib, struct, sys
-stock, gz, out = sys.argv[1:]
+stock, gz, out, clear = sys.argv[1:]
 b = open(stock, 'rb').read()
 assert b[:8] == b'ANDROID!'
 ksize, _, rsize, _, ssize, _, _, page, hv = struct.unpack_from('<9I', b, 8)
@@ -24,6 +27,9 @@ second = b[page + up(ksize) + up(rsize):][:ssize]
 kernel = open(gz, 'rb').read() + dtbs
 h = bytearray(b[:page])
 struct.pack_into('<I', h, 8, len(kernel))
+if clear == '1':
+	h[64:576] = bytes(512)
+	h[608:1632] = bytes(1024)
 sha = hashlib.sha1()
 for part in (kernel, ramdisk, second):
 	sha.update(part); sha.update(struct.pack('<I', len(part)))

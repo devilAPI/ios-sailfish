@@ -1,0 +1,21 @@
+label: gpt
+label-id: 98101B32-BBE2-4BF2-A06E-2BB33D000C20
+device: /dev/sda
+unit: sectors
+first-lba: 6
+last-lba: 13944826
+table-length: 12
+sector-size: 4096
+
+/dev/sda1 : start=           6, size=           2, type=2C86E742-745E-4FDD-BFD8-B6A7AC638772, uuid=00000001-0000-0000-0000-000000000000, name="ssd"
+/dev/sda2 : start=           8, size=      204800, type=5594C694-C871-4B5F-90B1-690A6F68E0F7, uuid=00000002-0000-0000-0000-000000000000, name="cache"
+/dev/sda3 : start=      204808, size=         256, type=82ACC91F-357C-4A68-9C8F-689E1B1A23A1, uuid=00000003-0000-0000-0000-000000000000, name="misc"
+/dev/sda4 : start=      205064, size=         128, type=DE7D4029-0F5B-41C8-AE7E-F6C023A02B33, uuid=00000004-0000-0000-0000-000000000000, name="keystore"
+/dev/sda5 : start=      205192, size=          32, type=F65D4B16-343D-4E25-AAFC-BE99B6556A6D, uuid=00000005-0000-0000-0000-000000000000, name="devcfg"
+/dev/sda6 : start=      205224, size=          32, type=97D7B011-54DA-4835-B3C4-917AD6E73D74, uuid=00000006-0000-0000-0000-000000000000, name="fbop"
+/dev/sda7 : start=      205256, size=         128, type=91B72D4D-71E0-4CBF-9B8E-236381CFF17A, uuid=00000007-0000-0000-0000-000000000000, name="frp"
+/dev/sda8 : start=      205384, size=         128, type=97D7B011-54DA-4835-B3C4-917AD6E73D74, uuid=00000008-0000-0000-0000-000000000000, name="cryptkey"
+/dev/sda9 : start=      205512, size=     5242880, type=1B81E7E6-F50D-419B-A739-2AEEF8DA3335, uuid=00000009-0000-0000-0000-000000000000, name="userdata"
+/dev/sda10 : start=     5448392, size=       24576, type=0FC63DAF-8483-4772-8E79-3D69D8477DE4, uuid=3F1E36D0-0C2C-4D85-A46F-2AE1FCB67A4F, name="los_boot"
+/dev/sda11 : start=     5472968, size=        4096, type=0FC63DAF-8483-4772-8E79-3D69D8477DE4, uuid=75229C13-7FF3-4087-AB80-916E50A97EF4, name="los_metadata"
+/dev/sda12 : start=     5477064, size=     8467763, type=0FC63DAF-8483-4772-8E79-3D69D8477DE4, uuid=06651F9F-6B4F-4B70-9A67-6821EFB6D87A, name="los_data"

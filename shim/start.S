@@ -39,6 +39,41 @@ _start:
 3:	wfe
 	b	3b
 
+/*
+ * Android path (android.c): copied to free high memory and called there, as
+ * it overwrites the shim. x0 kernel dst, x1 src, x2 len, x3 DTB dst, x4 DTB
+ * src, x5 DTB len, x6 entry. Position independent, no stack, MMU off.
+ */
+	.balign 8
+	.globl tramp_begin
+	.globl tramp_end
+tramp_begin:
+	add	x2, x2, #15
+	bic	x2, x2, #15
+1:	cbz	x2, 2f
+	ldp	x7, x8, [x1], #16
+	stp	x7, x8, [x0], #16
+	sub	x2, x2, #16
+	b	1b
+2:	add	x5, x5, #15
+	bic	x5, x5, #15
+	mov	x9, x3
+3:	cbz	x5, 4f
+	ldp	x7, x8, [x4], #16
+	stp	x7, x8, [x9], #16
+	sub	x5, x5, #16
+	b	3b
+4:	dsb	sy
+	ic	iallu
+	dsb	sy
+	isb
+	mov	x0, x3
+	mov	x1, xzr
+	mov	x2, xzr
+	mov	x3, xzr
+	br	x6
+tramp_end:
+
 /* PSCI CPU_ON target. x0 = context id = cpu index (1..7). */
 	.globl secondary_entry
 secondary_entry:

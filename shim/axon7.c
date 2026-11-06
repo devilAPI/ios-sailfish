@@ -11,6 +11,7 @@
 #include "pstore.h"
 #include "pmic.h"
 #include "pmos.h"
+#include "android.h"
 
 #define PSCI_SYSTEM_RESET	0x84000009UL
 #define IMEM_RESTART_REASON	0x066bf65cUL
@@ -62,7 +63,9 @@ extern char _end[];
  * Dual boot menu: Vol+/Vol- move the highlight, Power starts the entry.
  * Keys count only after they were seen released, so the power-on press (or
  * a key still held from the ZTE logo) does nothing. With no key pressed iOS
- * starts after MENU_SECS. A failed postmarketOS start shows why and returns
+ * starts after MENU_SECS. Entries: iOS (XNU payload), postmarketOS (bundle
+ * in the ramdisk slot, pmos.c), LineageOS (Android boot image in the
+ * los_boot partition, android.c). A failed start shows why and returns
  * to the menu. Holding Volume Down at power-on is not used: ZTE LK takes
  * that itself (FTM mode) before this code runs.
  */
@@ -71,8 +74,8 @@ extern char _end[];
 #endif
 #define POLL_MS		20
 
-enum { MENU_IOS, MENU_PMOS, MENU_N };
-static const char menu_names[MENU_N][16] = { "iOS", "postmarketOS" };	/* no pointers: no ABS64 relocs */
+enum { MENU_IOS, MENU_PMOS, MENU_LOS, MENU_N };
+static const char menu_names[MENU_N][16] = { "iOS", "postmarketOS", "LineageOS" };	/* no pointers: no ABS64 relocs */
 
 static void menu_draw(int top, int sel, const char *status)
 {
@@ -94,7 +97,7 @@ static void menu_draw(int top, int sel, const char *status)
 static void boot_menu(uint64_t dtb)
 {
 	static const enum pmic_key keys[3] = { KEY_POWER, KEY_VOLUP, KEY_VOLDOWN };
-	int armed[3] = { 0, 0, 0 }, sel = MENU_IOS, waiting = 1, pmos_failed = 0;
+	int armed[3] = { 0, 0, 0 }, sel = MENU_IOS, waiting = 1, pmos_failed = 0, los_failed = 0;
 	uint64_t f = rsr("cntfrq_el0"), deadline = rsr("cntpct_el0") + f * MENU_SECS;
 	char status[40];
 
@@ -151,6 +154,19 @@ static void boot_menu(uint64_t dtb)
 			} else if (sel == MENU_IOS) {
 				plog_str("MENU: iOS\n");
 				return;
+			} else if (sel == MENU_LOS && los_failed) {
+				menu_draw(top, sel, "LineageOS failed, see below");
+			} else if (sel == MENU_LOS) {
+				plog_str("MENU: LineageOS\n");
+				menu_draw(top, sel, "starting LineageOS");
+				const char *why = android_boot(dtb);
+				plog_str("LOS: ");
+				plog_str(why);
+				plog_str("\n");
+				con_line(top + MENU_N + 2, "LOS", why, RED);
+				los_failed = 1;
+				sel = MENU_IOS;
+				menu_draw(top, sel, "LineageOS failed, choose again");
 			} else if (pmos_failed) {
 				/* pmos_boot may have moved the Image already: no second try */
 				menu_draw(top, sel, "postmarketOS failed, see below");
@@ -186,6 +202,7 @@ void shim_main(uint64_t dtb)
 	plog_hex("DTB", dtb);
 	plog_hex("PAYLOAD", (uintptr_t)_end);
 
+	android_note_lk(dtb);	/* LK's appended bootargs, before anything moves */
 	/* before the first pixel: the bundle lies on the framebuffer */
 	plog_hex("PMOS stash", (uint32_t)pmos_stash(dtb, PMOS_STASH));
 
