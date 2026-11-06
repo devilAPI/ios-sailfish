@@ -48,7 +48,7 @@
  	printf("SAILFISH WLAN: chip in reset: clkreq in %u, wake in %u\n", rd(wl_clkreq, 4) & 1u, rd(wl_wake, 4) & 1u);
 --- /dev/null
 +++ b/bsd/dev/axon7_bt.c
-@@ -0,0 +1,1068 @@
+@@ -0,0 +1,1090 @@
 +/*
 + * ZTE Axon 7 Bluetooth, stage 1: bring up the Bluetooth half of the QCA6174
 + * ("ROME" 3.2: SoC 0x44, ROM 0x0302) on BLSP1 UART2 and test it from the
@@ -207,6 +207,23 @@
 +	}
 +	*len = (uint32_t)v[1];
 +	return (const uint8_t *)phystokv(v[0]);
++}
++
++/*
++ * Test boots: IMEM restart reason "recovery" (0x066bf65c = 0x77665502, as
++ * the shim and ZTE's LK use it), so any reset of this boot (the test panic,
++ * a hang the watchdog or a forced restart ends) comes back in TWRP and not
++ * in the boot menu, whose setting still says iOS.
++ */
++static void
++bt_restart_to_recovery(void)
++{
++	vm_offset_t imem = bt_map(0x066bf000u, 0x1000);
++	if (imem) {
++		*(volatile uint32_t *)(imem + 0x65c) = 0x77665502u;
++		__asm__ volatile ("dsb sy" ::: "memory");
++	}
++	printf("AXON7 BT: restart reason set to recovery (axon7bttest): %s\n", imem ? "ok" : "MAP FAILED");
 +}
 +
 +/* ---- clocks, pins, power ---- */
@@ -984,7 +1001,8 @@
 +		if (deadline && mach_absolute_time() > deadline) {
 +			sweet_log_kick();
 +			bt_msleep(3000);
-+			panic("AXON7 BT: test done (axon7bttest), back to recovery");
++			bt_restart_to_recovery();
++		panic("AXON7 BT: test done (axon7bttest), back to recovery");
 +		}
 +		assert_wait_timeout((event_t)&bt_tty, THREAD_UNINT, 1, NSEC_PER_MSEC);
 +		(void)thread_block(THREAD_CONTINUE_NULL);
@@ -1056,6 +1074,7 @@
 +		bt_msleep(bt_test_secs * 1000);
 +		sweet_log_kick();
 +		bt_msleep(3000);        /* the log thread writes the ring to the disk */
++		bt_restart_to_recovery();
 +		panic("AXON7 BT: test done (axon7bttest), back to recovery");
 +	}
 +	thread_terminate(current_thread());
@@ -1103,6 +1122,9 @@
 +		return;
 +	}
 +	(void)PE_parse_boot_argn("axon7bttest", &bt_test_secs, sizeof(bt_test_secs));
++	if (bt_test_secs) {
++		bt_restart_to_recovery();
++	}
 +	int tty = 0;
 +	(void)PE_parse_boot_argn("axon7bttty", &tty, sizeof(tty));
 +	bt_tty_on = tty != 0;
