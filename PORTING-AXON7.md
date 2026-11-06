@@ -133,7 +133,7 @@ Keeping both: `tools/axon7-cycle.sh` keeps the phone's bundle when it writes
 a new iOS kernel (`KEEP_PMOS=0` drops it, `PMOS_BUNDLE=F` installs F);
 postmarketOS has `deviceinfo_flash_kernel_on_update="false"` and rebuilds
 its half on the phone (`/usr/libexec/axon7-dualboot-update`, from the /boot
-apk trigger and an OpenRC service at boot; it refuses a boot partition
+apk trigger and a systemd/OpenRC service at boot; it refuses a boot partition
 without the iOS shim). Sizes: iOS 7.5 MB + bundle 45.8 MB = 52.8 of 64 MiB.
 Host test of `pmos.c`/`fdt.c` against a real bundle: aligned, two
 misaligned placements, four damaged bundles.
