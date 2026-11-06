@@ -30,5 +30,8 @@ struct pmos_hdr {
  */
 int pmos_stash(uintptr_t lk_dtb, uintptr_t dst);
 
+/* Read the bundle from the pmos_boot partition to dst (used by pmos_boot() then). */
+int pmos_load_part(uintptr_t dst);
+
 /* Boot Linux from the bundle the bootloader loaded as the ramdisk; returns only on error. */
 const char *pmos_boot(uintptr_t lk_dtb);

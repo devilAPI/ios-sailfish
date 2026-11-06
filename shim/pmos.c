@@ -13,6 +13,9 @@
 #include "pmos.h"
 #include "console.h"
 #include "fdt.h"
+#ifndef PMOS_HOST_TEST
+#include "ufsr.h"
+#endif
 
 #define SZ_2M		0x200000UL
 #define FDT_MAGIC_BE	0xedfe0dd0u	/* d00dfeed read little-endian */
@@ -65,6 +68,32 @@ int pmos_stash(uintptr_t lk_dtb, uintptr_t dst)
 	stash_re = dst + (re - rs);
 	return 1;
 }
+
+#ifndef PMOS_HOST_TEST
+/*
+ * The bundle's own partition on LUN 0 (pmos_boot): LUNs 1-4, with `boot`,
+ * are write protected while the phone runs normally, so postmarketOS keeps
+ * its bundle here (axon7-dualboot-update). Preferred over the copy in the
+ * boot image's ramdisk slot. 1 if a bundle was read to dst.
+ */
+static uint8_t part_hdr[4096] __attribute__((aligned(4096)));
+
+int pmos_load_part(uintptr_t dst)
+{
+	struct ufsr_part p;
+	/* header to a scratch block first: dst may hold the copy LK loaded (the fallback) */
+	if (ufsr_open() || ufsr_find("pmos_boot", &p) || ufsr_read(p.lun, p.first, 1, (uintptr_t)part_hdr))
+		return 0;
+	const struct pmos_hdr *h = (const struct pmos_hdr *)part_hdr;
+	if (!magic_ok(h->magic) || h->total < sizeof(*h) || h->total > (uint64_t)p.blocks * 4096u)
+		return 0;
+	if (ufsr_read(p.lun, p.first, (uint32_t)((h->total + 4095) / 4096), dst))
+		return 0;
+	stash_rs = dst;
+	stash_re = dst + ((const struct pmos_hdr *)dst)->total;
+	return 1;
+}
+#endif
 
 static uint64_t sum64(uintptr_t p, uint64_t n)
 {

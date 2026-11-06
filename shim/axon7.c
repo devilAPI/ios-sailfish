@@ -12,6 +12,7 @@
 #include "pmic.h"
 #include "pmos.h"
 #include "android.h"
+#include "ufsr.h"
 
 #define PSCI_SYSTEM_RESET	0x84000009UL
 #define IMEM_RESTART_REASON	0x066bf65cUL
@@ -94,11 +95,89 @@ static void menu_draw(int top, int sel, const char *status)
 	con_flush();
 }
 
+/*
+ * Stored default (tools: axon7-bootmenu): the last 4 KiB block of `misc`
+ * (LUN 0, writable from every OS; Android uses only its first 64 KiB):
+ * "AX7BOOT1", u32 entry, u32 countdown seconds (0: MENU_SECS), u32 entry ^
+ * 0xa5a5a5a5. Read-only here; without it the menu defaults to iOS.
+ */
+static uint8_t cfg_blk[4096] __attribute__((aligned(4096)));
+
+static int boot_setting(int *secs)
+{
+	struct ufsr_part p;
+	int entry = -1;
+	if (ufsr_open() == 0 && ufsr_find("misc", &p) == 0 && p.blocks &&
+	    ufsr_read(p.lun, p.first + p.blocks - 1, 1, (uintptr_t)cfg_blk) == 0) {
+		static const char magic[8] = { 'A', 'X', '7', 'B', 'O', 'O', 'T', '1' };
+		uint32_t e = 0, t = 0, c = 0;
+		int ok = 1;
+		for (int i = 0; i < 8; i++)
+			ok &= cfg_blk[i] == (uint8_t)magic[i];
+		for (int i = 3; i >= 0; i--) {
+			e = e << 8 | cfg_blk[8 + i];
+			t = t << 8 | cfg_blk[12 + i];
+			c = c << 8 | cfg_blk[16 + i];
+		}
+		if (ok && e < MENU_N && c == (e ^ 0xa5a5a5a5u)) {
+			entry = (int)e;
+			*secs = t && t < 100 ? (int)t : MENU_SECS;
+		}
+	}
+	ufsr_release();
+	plog_hex("MENU default", (uint32_t)entry);
+	return entry;
+}
+
+/*
+ * Start entry sel. Returns 1 for iOS (the caller returns to shim_main, which
+ * starts the XNU payload); otherwise the entry failed (shown under the menu)
+ * and 0 is returned with *sel back on iOS. failed[] blocks a second try (the
+ * postmarketOS Image may have been moved, LineageOS staging overwritten).
+ */
+static int start_entry(uint64_t dtb, int top, int *sel, int failed[MENU_N])
+{
+	if (*sel == MENU_IOS) {
+		plog_str("MENU: iOS\n");
+		return 1;
+	}
+	if (failed[*sel]) {
+		menu_draw(top, *sel, "failed before, see below");
+		return 0;
+	}
+	const char *why, *label;
+	if (*sel == MENU_LOS) {
+		plog_str("MENU: LineageOS\n");
+		menu_draw(top, *sel, "starting LineageOS");
+		label = "LOS";
+		why = android_boot(dtb);
+	} else {
+		plog_str("MENU: postmarketOS\n");
+		menu_draw(top, *sel, "starting postmarketOS");
+		label = "PMOS";
+		/* the pmos_boot partition first, else the copy LK loaded (pmos_stash) */
+		plog_hex("PMOS from partition", (uint32_t)pmos_load_part(PMOS_STASH));
+		why = pmos_boot(dtb);
+	}
+	plog_str(label);
+	plog_str(": ");
+	plog_str(why);
+	plog_str("\n");
+	con_line(top + MENU_N + 2, label, why, RED);
+	failed[*sel] = 1;
+	*sel = MENU_IOS;
+	menu_draw(top, *sel, "failed, choose again");
+	return 0;
+}
+
 static void boot_menu(uint64_t dtb)
 {
 	static const enum pmic_key keys[3] = { KEY_POWER, KEY_VOLUP, KEY_VOLDOWN };
-	int armed[3] = { 0, 0, 0 }, sel = MENU_IOS, waiting = 1, pmos_failed = 0, los_failed = 0;
-	uint64_t f = rsr("cntfrq_el0"), deadline = rsr("cntpct_el0") + f * MENU_SECS;
+	int armed[3] = { 0, 0, 0 }, failed[MENU_N] = { 0 }, sel = MENU_IOS, waiting = 1;
+	int secs = MENU_SECS, def = boot_setting(&secs);
+	if (def >= 0)
+		sel = def;
+	uint64_t f = rsr("cntfrq_el0"), deadline = rsr("cntpct_el0") + f * (uint64_t)secs;
 	char status[40];
 
 	if (pmic_key_pressed(KEY_POWER) < 0 || pmic_key_pressed(KEY_VOLUP) < 0 ||
@@ -118,11 +197,15 @@ static void boot_menu(uint64_t dtb)
 		if (waiting) {
 			int left = now >= deadline ? 0 : (int)((deadline - now + f - 1) / f);
 			if (left == 0) {
-				plog_str("MENU: timeout, iOS\n");
-				return;
+				/* the default (stored or iOS), as if Power was pressed */
+				plog_str("MENU: timeout\n");
+				waiting = 0;
+				if (start_entry(dtb, top, &sel, failed))
+					return;
+				continue;
 			}
 			if (left != last_s) {
-				const char *a = "iOS in ";
+				const char *a = sel == MENU_PMOS ? "postmarketOS in " : sel == MENU_LOS ? "LineageOS in " : "iOS in ";
 				int j = 0;
 				while (*a)
 					status[j++] = *a++;
@@ -151,42 +234,13 @@ static void boot_menu(uint64_t dtb)
 			} else if (keys[k] == KEY_VOLDOWN) {
 				sel = (sel + 1) % MENU_N;
 				menu_draw(top, sel, "");
-			} else if (sel == MENU_IOS) {
-				plog_str("MENU: iOS\n");
+			} else if (start_entry(dtb, top, &sel, failed)) {
 				return;
-			} else if (sel == MENU_LOS && los_failed) {
-				menu_draw(top, sel, "LineageOS failed, see below");
-			} else if (sel == MENU_LOS) {
-				plog_str("MENU: LineageOS\n");
-				menu_draw(top, sel, "starting LineageOS");
-				const char *why = android_boot(dtb);
-				plog_str("LOS: ");
-				plog_str(why);
-				plog_str("\n");
-				con_line(top + MENU_N + 2, "LOS", why, RED);
-				los_failed = 1;
-				sel = MENU_IOS;
-				menu_draw(top, sel, "LineageOS failed, choose again");
-			} else if (pmos_failed) {
-				/* pmos_boot may have moved the Image already: no second try */
-				menu_draw(top, sel, "postmarketOS failed, see below");
-			} else {
-				plog_str("MENU: postmarketOS\n");
-				menu_draw(top, sel, "starting postmarketOS");
-				const char *why = pmos_boot(dtb);
-				plog_str("PMOS: ");
-				plog_str(why);
-				plog_str("\n");
-				con_line(top + MENU_N + 2, "PMOS", why, RED);
-				pmos_failed = 1;
-				sel = MENU_IOS;
-				menu_draw(top, sel, "postmarketOS failed, choose again");
 			}
 		}
 		delay_ms(POLL_MS);
 	}
 }
-
 
 void shim_main(uint64_t dtb)
 {

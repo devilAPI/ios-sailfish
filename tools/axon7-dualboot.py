@@ -16,7 +16,7 @@ Bundle (little-endian header, struct pmos_hdr in shim/pmos.h):
           follows it in RAM)
 
   axon7-dualboot.py bundle --image vmlinuz|Image --dtb X.dtb --initrd F --cmdline S -o BUNDLE
-  axon7-dualboot.py cmdline BOOT.img                      # bootargs of BOOT's bundle (exit 3 if none)
+  axon7-dualboot.py cmdline BOOT.img|BUNDLE               # bootargs of the bundle (exit 3 if none)
   axon7-dualboot.py combine BASE.img BUNDLE -o OUT.img    # BASE's kernel/second, BUNDLE as ramdisk
   axon7-dualboot.py extract BOOT.img -o BUNDLE            # exit 3 if BOOT has no bundle
   axon7-dualboot.py check BOOT.img                        # exit 0 only for a valid dual-boot image
@@ -249,10 +249,15 @@ def bundle_bootargs(bundle):
 
 def cmd_cmdline(a):
     with open(a.boot, 'rb') as f:
-        p = bootimg_parse(f.read())
-    if bundle_check(p['ramdisk']) is not None:
+        b = f.read()
+    if b[:8] == MAGIC:     # a raw bundle (the pmos_boot partition)
+        b = b[:bundle_parse(b)['total']]
+        rd = b
+    else:
+        rd = bootimg_parse(b)['ramdisk']
+    if bundle_check(rd) is not None:
         sys.exit(3)
-    c = bundle_bootargs(p['ramdisk'])
+    c = bundle_bootargs(rd)
     if not c:
         sys.exit(3)
     print(c)
