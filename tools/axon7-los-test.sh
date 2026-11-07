@@ -112,7 +112,7 @@ while True:
 		echo "   $2: $(wc -l < "$out/delta-$2") MiB differ from $base"
 		while read -r i; do
 			dd if="$f" bs=1048576 skip="$i" count=1 2>/dev/null |
-				adb exec-in "dd of=$d bs=1048576 seek=$i count=1 conv=notrunc 2>/dev/null"
+				adb exec-in "dd of=$d bs=1048576 seek=$i conv=notrunc 2>/dev/null"	# no count: pipe reads come in pieces
 		done < "$out/delta-$2"
 	else
 		adb exec-in "dd of=$d bs=1048576 2>/dev/null" < "$f"
