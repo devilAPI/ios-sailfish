@@ -5,10 +5,13 @@
 #   postmarketOS  save boot + the misc boot-menu block, reboot to TWRP
 #   TWRP (adb)    system, vendor <- the build; los_boot <- its boot.img for
 #                 the shim (axon7-androidimg.py); boot <- a test shim
-#                 (LOS_TEST=1: any reset of the LineageOS boot goes to
-#                 TWRP); misc <- "LineageOS after 1 s"
+#                 (LOS_TEST=1: one LineageOS boot, any reset after it
+#                 goes to TWRP, a hang before the kernel's watchdog
+#                 driver ends after 30 s); misc <- "LineageOS after 1 s"
 #   LineageOS     if adb comes up (test builds: AXON7_ADB_KEYS): props,
-#                 mounts, dmesg, logcat, a screenshot; then reboot recovery
+#                 mounts, dmesg, logcat, a screenshot; then reboot recovery.
+#                 Test builds restart a boot that hangs after 25 min
+#                 (axon7-testguard.sh), the shim then goes to TWRP
 #   TWRP          pstore (kernel log of the boot), boot and misc restored,
 #                 reboot to postmarketOS
 #
@@ -164,14 +167,17 @@ if [ "$state" = device ]; then
 	adb reboot recovery
 	waitfor recovery 300 || { echo "LineageOS did not reboot to TWRP" >&2; exit 3; }
 elif [ "$state" != recovery ]; then
-	echo "neither LineageOS nor TWRP on adb: the phone needs a look" >&2
-	exit 3
+	say "no adb from LineageOS: waiting for its time limit (25 min) and TWRP"
+	waitfor recovery 1800 || { echo "neither LineageOS nor TWRP on adb: the phone needs a look" >&2; exit 3; }
 fi
 sleep 5
 say "TWRP: kernel log of the LineageOS boot, restoring boot and the boot menu"
-adb shell 'mount -t pstore pstore /sys/fs/pstore 2>/dev/null; ls /sys/fs/pstore' | tr -d '\r' | while read -r f; do
+adb shell 'mount -t pstore pstore /sys/fs/pstore 2>/dev/null; ls -1 /sys/fs/pstore' | tr -d '\r' | while read -r f; do
 	[ -n "$f" ] && adb exec-out "cat /sys/fs/pstore/$f" > "logs/$name-pstore-$f.txt"
 done
+# axon7-testlog.sh (test builds): props, dmesg, logcat of a boot that got to post-fs
+md=$(dev los_metadata)
+[ -n "$md" ] && adb exec-out "head -c 16777216 $md" | strings -n 4 > "logs/$name-testlog.txt"
 put "$out/boot-before.img" boot
 putblk "$out/misc-before.bin"
 adb reboot

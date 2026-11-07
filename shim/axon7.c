@@ -26,6 +26,13 @@
 #define WDT_EN			0x08
 #define WDT_BARK		0x10
 #define WDT_BITE		0x14
+/*
+ * LOS_TEST: set in IMEM (kept over warm resets) when the test starts
+ * LineageOS, so the next start of this shim knows that boot is over. The
+ * last word of shared IMEM, past emergency_download_mode@fe0.
+ */
+#define IMEM_LOS_TEST		0x066bfffcUL
+#define LOS_TEST_MARK		0x4c4f5354U	/* "LOST" */
 
 #define rsr(r) ({ uint64_t _v; __asm__ volatile("mrs %0, " r : "=r"(_v)); _v; })
 
@@ -41,6 +48,22 @@ static void __attribute__((noreturn)) psci_reset(void)
 	for (;;)
 		__asm__ volatile("wfe");
 }
+
+#if LOS_TEST
+/*
+ * Restart reason recovery: PM8994 PON SOFT_RB_SPARE reboot mode 1 (what
+ * ZTE's LK reads) and IMEM.
+ */
+static int los_test_recovery_reason(void)
+{
+	uint8_t spare = 0;
+	int r = pmic_read(PM8994_PON_PPID, 0x8f, &spare);
+	if (r == 0)
+		r = pmic_write(PM8994_PON_PPID, 0x8f, (uint8_t)((spare & 0x03u) | (1u << 2)));
+	*(volatile uint32_t *)IMEM_RESTART_REASON = RESTART_RECOVERY;
+	return r;
+}
+#endif
 
 static void delay_ms(unsigned ms)
 {
@@ -156,20 +179,21 @@ static int start_entry(uint64_t dtb, int top, int *sel, int failed[MENU_N])
 		label = "LOS";
 #if LOS_TEST
 		/*
-		 * Unattended LineageOS tests (build-axon7.sh LOS_TEST=1): any
-		 * reset of this boot, a kernel crash before init included, goes
-		 * to TWRP instead of this menu (whose setting says LineageOS):
-		 * restart reason recovery in PM8994 PON SOFT_RB_SPARE (reboot
-		 * mode 1, what ZTE's LK reads) and in IMEM.
+		 * Unattended LineageOS tests (build-axon7.sh LOS_TEST=1): one
+		 * LineageOS boot, then TWRP. A reset by the hardware (watchdog,
+		 * a crash before the kernel's restart driver) goes to TWRP by
+		 * the restart reason; a reset by the kernel's restart driver
+		 * sets "normal" again, so the IMEM mark sends the next start of
+		 * this shim to TWRP (boot_menu). The watchdog (30 s, the
+		 * kernel's msm_watchdog takes it over) covers a hang before that.
 		 */
-		{
-			uint8_t spare = 0;
-			int r = pmic_read(PM8994_PON_PPID, 0x8f, &spare);
-			if (r == 0)
-				r = pmic_write(PM8994_PON_PPID, 0x8f, (uint8_t)((spare & 0x03u) | (1u << 2)));
-			*(volatile uint32_t *)IMEM_RESTART_REASON = RESTART_RECOVERY;
-			plog_hex("LOS test: restart reason recovery, pmic", (uint32_t)r);
-		}
+		wr32(IMEM_LOS_TEST, LOS_TEST_MARK);
+		plog_hex("LOS test: restart reason recovery, pmic", (uint32_t)los_test_recovery_reason());
+		wr32(APSS_WDT + WDT_BARK, 30u * 32768u);
+		wr32(APSS_WDT + WDT_BITE, 30u * 32768u);
+		wr32(APSS_WDT + WDT_RST, 1);
+		wr32(APSS_WDT + WDT_EN, 1);
+		__asm__ volatile("dsb sy" ::: "memory");
 #endif
 		why = android_boot(dtb);
 	} else {
@@ -196,6 +220,21 @@ static void boot_menu(uint64_t dtb)
 	static const enum pmic_key keys[3] = { KEY_POWER, KEY_VOLUP, KEY_VOLDOWN };
 	int armed[3] = { 0, 0, 0 }, failed[MENU_N] = { 0 }, sel = MENU_IOS, waiting = 1;
 	int secs = MENU_SECS, def = boot_setting(&secs);
+#if LOS_TEST
+	if (rd32(IMEM_LOS_TEST) == LOS_TEST_MARK) {
+		/* the test's LineageOS boot is over (start_entry): TWRP */
+		wr32(IMEM_LOS_TEST, 0);
+		plog_hex("LOS test: LineageOS boot over, TWRP; pmic", (uint32_t)los_test_recovery_reason());
+		con_str("LOS TEST", "LineageOS boot over, TWRP");
+		con_flush();
+		/* warm reset (keeps RAM: the kernel log in ramoops): PS_HOLD reset type, then PSCI */
+		pmic_write(PM8994_PON_PPID, 0x5b, 0x00);
+		delay_ms(1);
+		pmic_write(PM8994_PON_PPID, 0x5a, 0x01);
+		pmic_write(PM8994_PON_PPID, 0x5b, 0x80);
+		psci_reset();
+	}
+#endif
 	if (def >= 0)
 		sel = def;
 	uint64_t f = rsr("cntfrq_el0"), deadline = rsr("cntpct_el0") + f * (uint64_t)secs;
