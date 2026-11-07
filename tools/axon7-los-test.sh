@@ -25,6 +25,8 @@
 #   the newest xnu/out-*/xnu-kernel/kernel.development.sweet); only the
 #   shim matters for this test, the image is replaced afterwards.
 #   LOS_WAIT (default 900): seconds to wait for LineageOS or TWRP.
+#   LOS_INSTALL=1: install instead of a test: system, vendor and los_boot
+#   only (the installed boot image and its boot menu stay), then reboot.
 #   LOS_BASE=research/axon7/OLDNAME: the phone has that run's images; only
 #   the MiB blocks that differ are written (then the whole partition is
 #   checked). LOS_SKIP_IMAGES=1: system and vendor are already the build's. A run that
@@ -58,6 +60,9 @@ python3 -I tools/axon7-androidimg.py check "$out/los-boot.img"
 resume=0
 if [ "$(adb get-state 2>/dev/null)" = recovery ] && [ -s "$out/boot-before.img" ] && [ -s "$out/misc-before.bin" ] && [ -s "$out/misc-blocks" ]; then
 	resume=1	# a run of this NAME stopped in TWRP: go on from there
+elif [ "${LOS_INSTALL:-0}" = 1 ] && [ "$(adb get-state 2>/dev/null)" = recovery ]; then
+	resume=1	# install from TWRP: boot and misc are not touched
+	echo 0 > "$out/misc-blocks"
 fi
 if [ $resume = 1 ]; then
 	say "resuming in TWRP with the saved boot and boot-menu block"
@@ -75,10 +80,13 @@ echo "$misc_blocks" > "$out/misc-blocks"
 fi
 python3 -I -c 'import struct,sys; sys.stdout.buffer.write((b"AX7BOOT1"+struct.pack("<III",2,1,2^0xa5a5a5a5)).ljust(4096,b"\0"))' > "$out/misc-los.bin"
 
+install=${LOS_INSTALL:-0}
+if [ "$install" != 1 ]; then
 say "test shim image (LOS_TEST=1)"
 LOS_TEST=1 WDT_SECS=0 BUILD_ONLY=1 PMOS_BUNDLE="$out/pmos.bundle" \
 	tools/axon7-cycle.sh "$kernel" "$name" "$(cat tools/axon7-bootargs.txt)" >/dev/null
 python3 -I tools/axon7-dualboot.py check "$out/boot.img" >/dev/null
+fi
 
 if [ $resume = 0 ]; then
 	say "postmarketOS -> TWRP"
@@ -140,6 +148,11 @@ if [ "${LOS_SKIP_IMAGES:-0}" != 1 ]; then	# LOS_SKIP_IMAGES=1: system and vendor
 	put "$out/vendor.raw" vendor
 fi
 put "$out/los-boot.img" los_boot
+if [ "$install" = 1 ]; then
+	adb reboot
+	say "installed; the boot menu is as it was"
+	exit 0
+fi
 put "$out/boot.img" boot
 putblk "$out/misc-los.bin"
 adb reboot
