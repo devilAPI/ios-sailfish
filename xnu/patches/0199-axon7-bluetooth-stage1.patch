@@ -48,7 +48,7 @@
  	printf("SAILFISH WLAN: chip in reset: clkreq in %u, wake in %u\n", rd(wl_clkreq, 4) & 1u, rd(wl_wake, 4) & 1u);
 --- /dev/null
 +++ b/bsd/dev/axon7_bt.c
-@@ -0,0 +1,1175 @@
+@@ -0,0 +1,1113 @@
 +/*
 + * ZTE Axon 7 Bluetooth, stage 1: bring up the Bluetooth half of the QCA6174
 + * ("ROME" 3.2: SoC 0x44, ROM 0x0302) on BLSP1 UART2 and test it from the
@@ -345,7 +345,7 @@
 +	wr(bt_uart, U_CR, CR_RESET_BRK);
 +	wr(bt_uart, U_CR, CR_RESET_CTS);
 +	wr(bt_uart, U_CR, CR_RESET_RFR);
-+	wr(bt_uart, U_DMEN, 0);                 /* no BAM: FIFO mode */
++	wr(bt_uart, U_DMEN, 1u << 5);           /* no BAM; RX single-character mode (RX_SC_ENABLE) */
 +	wr(bt_uart, U_IMR, 1u << 3);            /* polled; RXSTALE unmasked so ISR shows it (SPI 108 is not routed) */
 +	wr(bt_uart, U_MR2, (3u << 4) | (1u << 2));                              /* 8 bits, 1 stop, no parity */
 +	uint32_t rfr = BT_FIFO - 12;            /* msm_startup's auto-RFR level */
@@ -401,11 +401,8 @@
 +	return true;
 +}
 +
-+static uint32_t bt_slop;
-+static unsigned bt_slop_n;
 +static unsigned bt_overruns;
 +static uint32_t bt_rx_taken;            /* bytes read since DMRX was armed */
-+static uint32_t bt_stale_left;          /* valid bytes still in the FIFO after a stale event */
 +static bool bt_forced;                  /* FORCE_STALE given for the bytes now in the packing buffer */
 +
 +static void
@@ -419,80 +416,22 @@
 +}
 +
 +/*
-+ * One received byte, or -1 after timeout_us. UARTDM packs bytes into words;
-+ * a word reaches the FIFO full, except at a stale event (the line idle for
-+ * the stale timeout), which pushes the partial last word and latches the
-+ * byte count since DMRX was armed in RX_TOTAL_SNAP (msm_handle_rx_dm). SR is
-+ * read before ISR: a word present while no stale was latched is full.
++ * One received byte, or -1 after timeout_us. RX runs in single-character
++ * mode (DMEN RX_SC_ENABLE): every FIFO entry holds one byte, so there is no
++ * packing buffer and no stale count to get right (packed mode lost the
++ * tail of the rampatch's last acknowledgement in test boots 4-6).
 + */
 +static int
 +bt_getc(uint32_t timeout_us)
 +{
 +	for (uint32_t waited = 0;; waited += 10) {
-+		if (bt_slop_n) {
-+			uint8_t c = (uint8_t)(bt_slop >> (8 * (4 - bt_slop_n)));
-+			bt_slop_n--;
-+			return c;
-+		}
 +		uint32_t sr = rd(bt_uart, U_SR);
 +		if (sr & SR_OVERRUN) {
 +			bt_overruns++;
 +			wr(bt_uart, U_CR, CR_RESET_ERR);
 +		}
-+		if (bt_stale_left == 0 && (rd(bt_uart, U_ISR) & (1u << 3))) {   /* RXSTALE */
-+			uint32_t total = rd(bt_uart, U_RX_SNAP);
-+			bt_stale_left = total > bt_rx_taken ? total - bt_rx_taken : 0;
-+			if (bt_stale_left == 0) {
-+				bt_rx_rearm();
-+				continue;
-+			}
-+			sr = rd(bt_uart, U_SR);
-+		}
-+		if (bt_stale_left) {
-+			if (!(sr & SR_RX_READY)) {
-+				/* counted bytes not in the FIFO: give up on them */
-+				bt_stale_left = 0;
-+				bt_rx_rearm();
-+				continue;
-+			}
-+			uint32_t n = bt_stale_left > 4 ? 4 : bt_stale_left;
-+			uint32_t w = rd(bt_uart, U_RF);
-+			bt_stale_left -= n;
-+			bt_slop = w << (8 * (4 - n));   /* first byte at the top of the window */
-+			bt_slop_n = n;
-+			if (bt_stale_left == 0) {
-+				bt_rx_rearm();
-+			}
-+			continue;
-+		}
 +		if (sr & SR_RX_READY) {
-+			bt_slop = rd(bt_uart, U_RF);
-+			bt_slop_n = 4;
-+			bt_rx_taken += 4;
-+			continue;
-+		}
-+		/*
-+		 * Bytes in the packing buffer and no stale event after 1 ms (seen
-+		 * after the rampatch's last acknowledgement): push them out as
-+		 * msm_poll_get_char_dm does; the stale event then counts them.
-+		 */
-+		unsigned partial = (rd(bt_uart, U_RXFS) >> 7) & 7u;
-+		if (waited >= 1000 && partial) {
-+			/*
-+			 * As msm_poll_get_char_dm: the packing buffer's count from
-+			 * RXFS, FORCE_STALE puts the word into the FIFO (no stale
-+			 * event follows, test boot 5), read it at once.
-+			 */
-+			wr(bt_uart, U_CR, CR_FORCE_STALE);
-+			for (unsigned t = 0; t < 100 && !(rd(bt_uart, U_SR) & SR_RX_READY); t++) {
-+				delay(1);
-+			}
-+			uint32_t w = rd(bt_uart, U_RF);
-+			bt_slop = w << (8 * (4 - partial));
-+			bt_slop_n = partial;
-+			bt_forced = true;
-+			bt_rx_rearm();
-+			continue;
++			return (int)(rd(bt_uart, U_RF) & 0xffu);
 +		}
 +		if (waited >= timeout_us) {
 +			return -1;
@@ -537,9 +476,8 @@
 +			for (int i = 0; i < l; i++) {
 +				int c = bt_getc(100000);
 +				if (c < 0) {
-+					printf("AXON7 BT: event %#x cut short (%d of %d): sr %#x isr %#x rxfs %#x snap %u taken %u left %u forced %d\n",
-+					    code, i, l, rd(bt_uart, U_SR), rd(bt_uart, U_ISR), rd(bt_uart, U_RXFS),
-+					    rd(bt_uart, U_RX_SNAP), bt_rx_taken, bt_stale_left, bt_forced);
++					printf("AXON7 BT: event %#x cut short (%d of %d): sr %#x isr %#x rxfs %#x\n",
++					    code, i, l, rd(bt_uart, U_SR), rd(bt_uart, U_ISR), rd(bt_uart, U_RXFS));
 +					return -1;
 +				}
 +				ev[i] = (uint8_t)c;
