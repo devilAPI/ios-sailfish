@@ -48,7 +48,7 @@
  	printf("SAILFISH WLAN: chip in reset: clkreq in %u, wake in %u\n", rd(wl_clkreq, 4) & 1u, rd(wl_wake, 4) & 1u);
 --- /dev/null
 +++ b/bsd/dev/axon7_bt.c
-@@ -0,0 +1,1148 @@
+@@ -0,0 +1,1162 @@
 +/*
 + * ZTE Axon 7 Bluetooth, stage 1: bring up the Bluetooth half of the QCA6174
 + * ("ROME" 3.2: SoC 0x44, ROM 0x0302) on BLSP1 UART2 and test it from the
@@ -406,6 +406,7 @@
 +static unsigned bt_overruns;
 +static uint32_t bt_rx_taken;            /* bytes read since DMRX was armed */
 +static uint32_t bt_stale_left;          /* valid bytes still in the FIFO after a stale event */
++static bool bt_forced;                  /* FORCE_STALE given for the bytes now in the packing buffer */
 +
 +static void
 +bt_rx_rearm(void)
@@ -414,6 +415,7 @@
 +	wr(bt_uart, U_DMRX, 0xffffff);
 +	wr(bt_uart, U_CR, CR_STALE_EN);
 +	bt_rx_taken = 0;
++	bt_forced = false;
 +}
 +
 +/*
@@ -469,6 +471,16 @@
 +			bt_rx_taken += 4;
 +			continue;
 +		}
++		/*
++		 * Bytes in the packing buffer and no stale event after 1 ms (seen
++		 * after the rampatch's last acknowledgement): push them out as
++		 * msm_poll_get_char_dm does; the stale event then counts them.
++		 */
++		if (!bt_forced && waited >= 1000 && ((rd(bt_uart, U_RXFS) >> 7) & 7u)) {
++			wr(bt_uart, U_CR, CR_FORCE_STALE);
++			bt_forced = true;
++			continue;
++		}
 +		if (waited >= timeout_us) {
 +			return -1;
 +		}
@@ -512,7 +524,9 @@
 +			for (int i = 0; i < l; i++) {
 +				int c = bt_getc(100000);
 +				if (c < 0) {
-+					printf("AXON7 BT: event %#x cut short (%d of %d)\n", code, i, l);
++					printf("AXON7 BT: event %#x cut short (%d of %d): sr %#x isr %#x rxfs %#x snap %u taken %u left %u forced %d\n",
++					    code, i, l, rd(bt_uart, U_SR), rd(bt_uart, U_ISR), rd(bt_uart, U_RXFS),
++					    rd(bt_uart, U_RX_SNAP), bt_rx_taken, bt_stale_left, bt_forced);
 +					return -1;
 +				}
 +				ev[i] = (uint8_t)c;
