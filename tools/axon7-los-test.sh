@@ -181,8 +181,25 @@ if [ "$state" = device ]; then
 		say "keeping LineageOS up for ${LOS_HOLD} s, logcat streamed to logs/$name-live.txt"
 		( while adb shell 'echo $(date +%T) backlight=$(cat /sys/class/leds/lcd-backlight/brightness) $(dumpsys power | grep -m1 -o "mWakefulness=[A-Za-z]*")' 2>&1 | tr -d '\r'; do sleep 30; done ) > "logs/$name-backlight.txt" &
 		bl=$!
+		# sleep/wake cycles after 1 min (power key events): wake-up time in the live
+		# log; with root, both DSPPs' (0x55000, 0x57000; PCC +0x1700) and the AD
+		# blocks' registers before sleep, after a wake, and after a wake without
+		# ppd (display post-processing) go to logs/NAME-dspp.txt
+		cat > "$out/dspp.sh" <<'DSPP'
+d=/sys/kernel/debug/mdp; [ -d $d ] || d=/sys/kernel/debug/mdss_mdp
+echo "== $1 $(date +%T) wake=$(dumpsys power | grep -m1 -o 'mWakefulness=[A-Za-z]*') ppd=$(getprop init.svc.ppd) dir=$d"
+f=mdp_; [ -e $d/mdp_off ] || f=
+for o in 55000 57000 56700 58700 79000 79800; do
+	echo "$o 40" > $d/${f}off 2>/dev/null && { echo "-- 0x$o"; cat $d/${f}reg 2>&1 | head -6; }
+done
+DSPP
+		adb push "$out/dspp.sh" /data/local/tmp/dspp.sh >/dev/null 2>&1 || true
+		( sleep 60
+		  adb shell 'sh /data/local/tmp/dspp.sh before; input keyevent KEYCODE_SLEEP; sleep 15; input keyevent KEYCODE_WAKEUP; sleep 10; sh /data/local/tmp/dspp.sh after-wake; setprop ctl.stop ppd; sleep 3; input keyevent KEYCODE_SLEEP; sleep 15; input keyevent KEYCODE_WAKEUP; sleep 10; sh /data/local/tmp/dspp.sh after-wake-no-ppd; setprop ctl.start ppd; sleep 5; input keyevent KEYCODE_SLEEP; sleep 15; input keyevent KEYCODE_WAKEUP; sleep 10; sh /data/local/tmp/dspp.sh after-wake-ppd-again' > "logs/$name-dspp.txt" 2>&1 ) &
+		wk=$!
 		timeout "$LOS_HOLD" adb logcat -b all -v threadtime > "logs/$name-live.txt" 2>&1 || true
-		kill "$bl" 2>/dev/null || true
+		kill "$bl" "$wk" 2>/dev/null || true
+		adb shell 'dmesg' > "logs/$name-dmesg-hold.txt" 2>&1 || true
 		state=$(adb get-state 2>/dev/null || true)
 		echo "   adb state after the hold: ${state:-none}"
 	fi
