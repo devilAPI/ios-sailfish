@@ -159,6 +159,15 @@ flow control, BT_EN after the Wi-Fi driver's chip power step
 `tools/axon7-remote-cycle.sh` runs such a boot from postmarketOS without
 USB (TWRP OpenRecoveryScripts flash, collect the logs and restore).
 
+Result (test boot bt7, 2026-11-07): rampatch (280 TLV segments, download
+mode 3) and NVM (33 tags) in, HCI_Reset 0, HCI 8 / LMP subversion 0x25a,
+manufacturer 29, BD address 18:68:6a:ee:7c:37 (the factory one), LE scan
+4 s: 224 advertising reports, 0 overruns; `/dev/cu.bluetooth` and
+`/dev/uart.bluetooth` made (`axon7bttty=1`). Lessons: the version answer is
+rtype 0x02 (EDL_APP_VER_RES_EVT) on ROME; UARTDM's packed RX mode lost the
+tail of short events (stale count / forced flush), single-character mode
+(DMEN RX_SC_ENABLE) has none of that. Nothing in iOS opens the port yet.
+
 **Stage 2 (plan)**: iOS 16 on the iPhone 8 boots a Broadcom BCM4357 over
 UART: bluetoothd asks BlueTool (Mach service `com.apple.BlueTool`, built-in
 scripts: `power on`, `device -D -S`, `bcm -w` = .hcd download through
@@ -182,6 +191,8 @@ after boot (coex, sleep, AFH) and whether it accepts manufacturer 29
 (Qualcomm) in Read_Local_Version or needs Broadcom's 15.
 
 ## To do
+
+- **Watchdog (fixed 2026-11-07, 841a29a)**: images built by `tools/axon7-flash-ios-kernel.sh` / `axon7-cycle.sh` armed the APSS watchdog with WDT_SECS=120, which the 20-bit BARK/BITE registers wrapped to 24 s; XNU never pets it, so iOS reset 24 s into every boot. Installs and remote test boots now build without it, the shim clamps to 32 s.
 
 - **Wi-Fi reconnect**: the first join of a boot works (0193: DHCP DISCOVER/OFFER/REQUEST/ACK to the radio's own MAC, 18.8k tx all completed OK, 27k rx, Sileo refresh, no firmware crash). After wifid asks to leave and joins again (Forget network, Private Address toggle, Wi-Fi off/on) the join succeeds but iOS hands down no frame at all: configd never restarts DHCP. Next: wifid/configd logs over SSH (`log stream`) while reproducing. Older notes: 4/4 on the data path never completes during the handshake (the firmware holds it until the keys are in) and the AP takes the management-path copy; without the data-path copy (0192) the data path stays dead. Private Wi-Fi Address is on in iOS but not applied (no setHardwareAddress), the AP answers the hardware MAC.
 - **Kernel CI**: GitHub retired the `macos-14` runner (`The configuration 'macos-14-arm64-us-default' is not supported`), and with it Xcode 15, which this xnu needs (Xcode 16's iig emits `IORPC.kernelContent`). Move `.github/workflows/xnu.yml` to macos-15 + Xcode 16 (patch the IORPC ABI) or another Xcode 15 source before any kernel change.
