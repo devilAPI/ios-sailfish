@@ -267,15 +267,21 @@ void shim_main(uint64_t dtb)
 	boot_menu(dtb);
 
 	/*
-	 * Re-arm the watchdog for the kernel (bite WDT_SECS after this): a hang
+	 * Re-arm the watchdog for the kernel (bite WDT_SECS after this, 32 s at
+	 * most: XNU does not pet it, so only for boots that end early): a hang
 	 * then ends in a warm reset that keeps RAM, so the kernel's early log
 	 * in the pstore zone (xnu sweet_early.c) can be read from Android.
 	 * WDT_SECS=0 (iOS root boots, log in the UFS ring): leave it off.
 	 */
 #if WDT_SECS
-	plog_hex("watchdog re-armed, secs", WDT_SECS);
-	wr32(APSS_WDT + WDT_BARK, WDT_SECS * 32768);
-	wr32(APSS_WDT + WDT_BITE, WDT_SECS * 32768);
+	/*
+	 * BARK/BITE hold 20 bits of 32768 Hz ticks: 32 s at most. More used to
+	 * wrap silently (120 s became 24 s and reset every iOS boot); clamp.
+	 */
+	const uint32_t wdt_ticks = WDT_SECS * 32768u > 0xfffffu ? 0xfffffu : WDT_SECS * 32768u;
+	plog_hex("watchdog re-armed, ticks", wdt_ticks);
+	wr32(APSS_WDT + WDT_BARK, wdt_ticks);
+	wr32(APSS_WDT + WDT_BITE, wdt_ticks);
 	wr32(APSS_WDT + WDT_RST, 1);
 	wr32(APSS_WDT + WDT_EN, 1);
 #endif

@@ -12,4 +12,6 @@ cd "$(dirname "$0")/.."
 for f in research/firmware/gpu/a530_pm4.fw research/firmware/wlan/qwlan30.bin; do
 	[ -f "$f" ] || { echo "missing $f: copy the firmware from your phone first (INSTALL.md, step 2)" >&2; exit 1; }
 done
-exec tools/axon7-cycle.sh "$1" "install-$(date +%Y%m%d-%H%M%S)" "$(cat tools/axon7-bootargs.txt)" 0
+# no watchdog: XNU never pets the APSS watchdog, which would reset iOS after
+# at most 32 s (it did after 24 s with the old default WDT_SECS=120)
+WDT_SECS=0 exec tools/axon7-cycle.sh "$1" "install-$(date +%Y%m%d-%H%M%S)" "$(cat tools/axon7-bootargs.txt)" 0

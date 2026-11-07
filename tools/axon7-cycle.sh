@@ -49,7 +49,9 @@ python3 -I tools/mkpayload.py "$kernel" "$out/axon7.adt" "$out/payload" --cmdlin
 size=$(stat -c %s "$out/payload")
 # LK: Image at 0x80080000, DTB at 0x82400000 -> payload + shim < ~35 MiB
 [ "$size" -lt $((35 * 1024 * 1024)) ] || { echo "payload $size bytes: too big for the LK load window" >&2; exit 1; }
-WDT_SECS=${WDT_SECS:-120} shim/build-axon7.sh backup/stock-lineage-boot.img loader "$out/payload"
+# WDT_SECS: APSS watchdog for early-boot tests (32 s at most, clamped by the
+# shim); 0 for anything that runs into the iOS userland
+WDT_SECS=${WDT_SECS:-30} shim/build-axon7.sh backup/stock-lineage-boot.img loader "$out/payload"
 cp shim/out/axon7-loader.img "$out/boot.img"
 
 # BUILD_ONLY=1: stop after $out/boot.img (tools/axon7-remote-cycle.sh flashes it

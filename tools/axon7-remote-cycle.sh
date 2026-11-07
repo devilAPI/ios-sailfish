@@ -49,7 +49,9 @@ root "dd if=/dev/disk/by-partlabel/misc bs=4096 skip=$((misc_blocks - 1)) count=
 python3 -I -c 'import struct,sys; sys.stdout.buffer.write((b"AX7BOOT1"+struct.pack("<III",0,1,0xa5a5a5a5)).ljust(4096,b"\0"))' > "$out/misc-ios.bin"
 
 echo "== building the test image"
-BUILD_ONLY=1 PMOS_BUNDLE="$out/pmos.bundle" tools/axon7-cycle.sh "$kernel" "$name" "$args"
+# no watchdog (XNU does not pet it, it would reset the test after <= 32 s):
+# the test kernel itself resets into TWRP (e.g. axon7bttest)
+WDT_SECS=${WDT_SECS:-0} BUILD_ONLY=1 PMOS_BUNDLE="$out/pmos.bundle" tools/axon7-cycle.sh "$kernel" "$name" "$args"
 python3 -I tools/axon7-dualboot.py check "$out/boot.img" >/dev/null
 
 B=/dev/block/bootdevice/by-name C=/cache/axon7-cycle
