@@ -112,12 +112,17 @@ static int ids_match(const void *lk, const void *dtb, const char *prop, uint32_t
 	return 1;
 }
 
-/* LK's tokens that belong to its own system-as-root boot image, not to ours */
+/*
+ * LK's tokens that belong to its own system-as-root boot image, not to ours;
+ * and kpti=: ZTE LK forces kernel page table isolation on for its 3.18
+ * kernel. The 4.4 kernel (no KASLR, so KPTI off by default; Kryo is not
+ * affected by Meltdown) stopped before its first console line with it.
+ */
 static int drop_token(const char *t, uint32_t n)
 {
 	/* char arrays, not pointers: no ABS64 relocations in the shim */
 	static const char exact[4][16] = { "skip_initramfs", "rootwait", "ro", "init=/init" };
-	static const char prefix[3][16] = { "root=", "dm=", "veritykeyid=" };
+	static const char prefix[4][16] = { "root=", "dm=", "veritykeyid=", "kpti=" };
 	for (unsigned i = 0; i < sizeof(exact) / sizeof(exact[0]); i++) {
 		uint32_t k = 0;
 		while (k < n && exact[i][k] && exact[i][k] == t[k])
