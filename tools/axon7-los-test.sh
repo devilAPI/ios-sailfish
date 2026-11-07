@@ -25,6 +25,8 @@
 #   the newest xnu/out-*/xnu-kernel/kernel.development.sweet); only the
 #   shim matters for this test, the image is replaced afterwards.
 #   LOS_WAIT (default 900): seconds to wait for LineageOS or TWRP.
+#   LOS_HOLD=SECONDS: keep LineageOS up that long after boot_completed with
+#   logcat streamed to logs/NAME-live.txt (catches a later shutdown/restart).
 #   LOS_INSTALL=1: install instead of a test: system, vendor and los_boot
 #   only (the installed boot image and its boot menu stay), then reboot.
 #   LOS_BASE=research/axon7/OLDNAME: the phone has that run's images; only
@@ -170,13 +172,35 @@ for t in $(seq 0 5 "$wait_s"); do
 done
 echo "   adb state: ${state:-none} after ${t}s"
 if [ "$state" = device ]; then
-	say "LineageOS is up: collecting"
+	say "LineageOS is up"
 	adb root >/dev/null 2>&1 || true
 	sleep 5
 	adb wait-for-device
 	for i in $(seq 1 60); do [ "$(adb shell getprop sys.boot_completed | tr -d '\r')" = 1 ] && break; sleep 5; done
+	if [ "${LOS_HOLD:-0}" -gt 0 ]; then
+		say "keeping LineageOS up for ${LOS_HOLD} s, logcat streamed to logs/$name-live.txt"
+		( while adb shell 'echo $(date +%T) backlight=$(cat /sys/class/leds/lcd-backlight/brightness) $(dumpsys power | grep -m1 -o "mWakefulness=[A-Za-z]*")' 2>&1 | tr -d '\r'; do sleep 30; done ) > "logs/$name-backlight.txt" &
+		bl=$!
+		timeout "$LOS_HOLD" adb logcat -b all -v threadtime > "logs/$name-live.txt" 2>&1 || true
+		kill "$bl" 2>/dev/null || true
+		state=$(adb get-state 2>/dev/null || true)
+		echo "   adb state after the hold: ${state:-none}"
+	fi
+fi
+if [ "$state" = device ] && [ "$(adb get-state 2>/dev/null || true)" != device ]; then
+	say "LineageOS went away during the hold: waiting for TWRP or postmarketOS"
+	state=
+	for t in $(seq 0 10 1800); do
+		[ "$(adb get-state 2>/dev/null || true)" = recovery ] && { state=recovery; break; }
+		if [ $((t % 30)) = 0 ] && pmos_up; then state=pmos; break; fi
+		sleep 10
+	done
+	echo "   then: ${state:-nothing} after ${t}s"
+fi
+if [ "$state" = device ]; then
+	say "collecting"
 	adb shell 'getprop' > "logs/$name-getprop.txt" 2>&1 || true
-	adb shell 'cat /proc/cmdline; uname -a; mount; df -h; ls -l /dev/block/by-name/' > "logs/$name-system.txt" 2>&1 || true
+	adb shell 'cat /proc/cmdline; uname -a; mount; df -h; ls -l /dev/block/by-name/; echo backlight $(cat /sys/class/leds/lcd-backlight/brightness /sys/class/leds/lcd-backlight/max_brightness); dumpsys power | grep -m3 -iE "mWakefulness=|mScreenOn|Display Power"' > "logs/$name-system.txt" 2>&1 || true
 	adb shell 'dmesg' > "logs/$name-dmesg.txt" 2>&1 || true
 	adb logcat -d -b all > "logs/$name-logcat.txt" 2>&1 || true
 	adb exec-out 'screencap -p' > "logs/$name-screen.png" 2>/dev/null || true
