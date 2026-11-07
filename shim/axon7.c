@@ -17,6 +17,10 @@
 #define PSCI_SYSTEM_RESET	0x84000009UL
 #define IMEM_RESTART_REASON	0x066bf65cUL
 #define RESTART_RECOVERY	0x77665502U
+#define PM8994_PON_PPID		0x008u
+#ifndef LOS_TEST
+#define LOS_TEST		0
+#endif
 #define APSS_WDT		0x9830000UL	/* qcom,wdt@9830000, 32768 Hz ticks */
 #define WDT_RST			0x04
 #define WDT_EN			0x08
@@ -150,6 +154,23 @@ static int start_entry(uint64_t dtb, int top, int *sel, int failed[MENU_N])
 		plog_str("MENU: LineageOS\n");
 		menu_draw(top, *sel, "starting LineageOS");
 		label = "LOS";
+#if LOS_TEST
+		/*
+		 * Unattended LineageOS tests (build-axon7.sh LOS_TEST=1): any
+		 * reset of this boot, a kernel crash before init included, goes
+		 * to TWRP instead of this menu (whose setting says LineageOS):
+		 * restart reason recovery in PM8994 PON SOFT_RB_SPARE (reboot
+		 * mode 1, what ZTE's LK reads) and in IMEM.
+		 */
+		{
+			uint8_t spare = 0;
+			int r = pmic_read(PM8994_PON_PPID, 0x8f, &spare);
+			if (r == 0)
+				r = pmic_write(PM8994_PON_PPID, 0x8f, (uint8_t)((spare & 0x03u) | (1u << 2)));
+			*(volatile uint32_t *)IMEM_RESTART_REASON = RESTART_RECOVERY;
+			plog_hex("LOS test: restart reason recovery, pmic", (uint32_t)r);
+		}
+#endif
 		why = android_boot(dtb);
 	} else {
 		plog_str("MENU: postmarketOS\n");

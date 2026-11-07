@@ -7,6 +7,8 @@
  * Returns 0 on success.
  */
 int pmic_read(uint16_t ppid, uint8_t addr, uint8_t *out);
+/* One-byte write, EE 0 (apps) owned peripherals only. 0 on success. */
+int pmic_write(uint16_t ppid, uint8_t addr, uint8_t val);
 
 enum pmic_key { KEY_POWER, KEY_VOLUP, KEY_VOLDOWN };
 

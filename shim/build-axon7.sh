@@ -7,7 +7,7 @@ stock=$(realpath "$1") kind=${2:-probe}
 payload=${3:+$(realpath "$3")}
 cd "$(dirname "$0")"
 CC="clang --target=aarch64-none-elf"
-CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -Wall -Wextra -DAXON7 -DWDT_SECS=${WDT_SECS:-120}"
+CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -Wall -Wextra -DAXON7 -DWDT_SECS=${WDT_SECS:-120} -DLOS_TEST=${LOS_TEST:-0}"
 O=out/axon7-$kind
 mkdir -p $O
 case $kind in

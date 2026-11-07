@@ -1,5 +1,5 @@
 /*
- * Minimal read-only SPMI access for the shim, the way xnu's sweet_keys.c
+ * Minimal SPMI access for the shim, the way xnu's sweet_keys.c
  * reads the Axon 7 volume keys (Linux spmi-pmic-arb v2): the APID of a
  * peripheral from the core's map (+0x800 + 4n: ppid in bits [19:8]),
  * preferring the one owned by EE 0 (cnfg +0x700 + 4n, bits [2:0]); then one
@@ -11,6 +11,7 @@
 #define SPMI_CORE	0x0400f000UL
 #define SPMI_CNFG	0x0400a000UL
 #define SPMI_OBS	0x04c00000UL	/* observer pages, 0x8000 per APID */
+#define SPMI_CHNLS	0x04400000UL	/* channel (write) pages, 0x8000 per APID */
 #define SPMI_APIDS	256u
 #define NO_APID		0xffffu
 
@@ -73,6 +74,32 @@ int pmic_read(uint16_t ppid, uint8_t addr, uint8_t *out)
 			*out = (uint8_t)rd32(obs + 0x18u);
 			return 0;
 		}
+	}
+	return -3;
+}
+
+/*
+ * One-byte write (EXT_WRITEL on the APID's channel page: WDATA0 +0x10, CMD
+ * +0x00, STATUS +0x08), only for peripherals owned by EE 0 (apps), as
+ * xnu's sweet_pmic_write.
+ */
+int pmic_write(uint16_t ppid, uint8_t addr, uint8_t val)
+{
+	uint16_t apid = find_apid(ppid);
+	if (apid == NO_APID)
+		return -1;
+	if ((rd32(SPMI_CNFG + 0x700u + 4u * apid) & 7u) != 0)
+		return -4;
+	uintptr_t ch = SPMI_CHNLS + 0x8000UL * apid;
+	*(volatile uint32_t *)(ch + 0x10u) = val;
+	__asm__ volatile("dmb oshst" ::: "memory");
+	*(volatile uint32_t *)ch = (uint32_t)addr << 4;		/* EXT_WRITEL, 1 byte */
+	__asm__ volatile("dsb osh" ::: "memory");
+	uint64_t end = cntpct() + cntfrq() / 1000;	/* 1 ms */
+	while (cntpct() < end) {
+		uint32_t st = rd32(ch + 0x08u);
+		if (st & 1u)
+			return (st & 0x0eu) ? -2 : 0;
 	}
 	return -3;
 }
