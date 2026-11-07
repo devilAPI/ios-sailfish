@@ -144,11 +144,15 @@ put "$out/boot.img" boot
 putblk "$out/misc-los.bin"
 adb reboot
 
-say "waiting for LineageOS (adb device) or TWRP (adb recovery), up to $wait_s s"
+say "waiting for LineageOS (adb device), TWRP (adb recovery) or postmarketOS, up to $wait_s s"
+pmos_up() {	# the test build's post-fs step points the boot menu at postmarketOS
+	ping -c 1 -W 1 "${host#*@}" >/dev/null 2>&1 && on true 2>/dev/null
+}
 state=
 for t in $(seq 0 5 "$wait_s"); do
 	state=$(adb get-state 2>/dev/null || true)
 	[ "$state" = device ] || [ "$state" = recovery ] && break
+	if [ $((t % 30)) = 25 ] && pmos_up; then state=pmos; break; fi
 	sleep 5
 done
 echo "   adb state: ${state:-none} after ${t}s"
@@ -166,6 +170,10 @@ if [ "$state" = device ]; then
 	echo "   boot_completed=$(adb shell getprop sys.boot_completed | tr -d '\r')"
 	adb reboot recovery
 	waitfor recovery 300 || { echo "LineageOS did not reboot to TWRP" >&2; exit 3; }
+elif [ "$state" = pmos ]; then
+	say "LineageOS restarted into postmarketOS: to TWRP for the logs and the restore"
+	root 'systemctl reboot --reboot-argument=recovery' >/dev/null 2>&1 || true
+	waitfor recovery 300 || { echo "no TWRP on adb after 300 s" >&2; exit 3; }
 elif [ "$state" != recovery ]; then
 	say "no adb from LineageOS: waiting for its time limit (25 min) and TWRP"
 	waitfor recovery 1800 || { echo "neither LineageOS nor TWRP on adb: the phone needs a look" >&2; exit 3; }
