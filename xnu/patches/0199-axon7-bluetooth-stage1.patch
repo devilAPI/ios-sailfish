@@ -1102,7 +1102,7 @@
 +	static const uint8_t ver_req[1] = { EDL_VER_REQ };
 +	int tries;
 +	for (tries = 0; tries < 3; tries++) {
-+		if (bt_edl(ver_req, 1, EDL_VER_REQ, ev, &l, true) == 0 && l >= 2 + 12) {
++		if (bt_edl(ver_req, 1, 0x02u /* EDL_APP_VER_RES_EVT, as btqca for ROME */, ev, &l, true) == 0 && l >= 2 + 12) {
 +			break;
 +		}
 +		bt_msleep(100);
