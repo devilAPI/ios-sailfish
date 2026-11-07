@@ -3,7 +3,7 @@
  *   cc -O1 -Wall -Wextra -Werror -DANDROID_HOST_TEST -Ishim shim/host_android_test.c shim/android.c shim/fdtw.c -o /tmp/ta
  *   /tmp/ta IMAGE.img LK.dtb OUT.dtb      (IMAGE from tools/axon7-androidimg.py convert)
  * then inspect OUT.dtb (dtc -I dtb OUT.dtb): /memory reg from LK, /chosen
- * bootargs = DTB's own + image cmdline + LK's extras without SAR tokens,
+ * bootargs = one string: DTB's own + image cmdline + LK's extras without SAR tokens,
  * linux,initrd-start/end around the ramdisk in the staging buffer.
  */
 #include <stdio.h>

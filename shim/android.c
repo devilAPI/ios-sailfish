@@ -9,8 +9,8 @@
  *  - pick the DTB matching this board (qcom,msm-id / qcom,board-id of the DTB
  *    LK chose for the shim's own boot image: same phone, same ids);
  *  - /memory reg from LK's DTB (LK fills it from the SMEM RAM table);
- *  - /chosen bootargs: the DTB's own bootargs, then (fdt_appendprop_string,
- *    as LK) the image's command line plus what LK appended for this boot
+ *  - /chosen bootargs: one string, the DTB's own bootargs, then the image's
+ *    command line plus what LK appended for this boot
  *    (serial number, panel, baseband, ...): the last string of LK's bootargs,
  *    minus the system-as-root arguments LK adds for its own boot image;
  *  - linux,initrd-start/end for the ramdisk, which stays where it was read;
@@ -273,30 +273,33 @@ const char *android_boot(uintptr_t lk_dtb)
 	if (!fdtw_setprop(w, cap, mnode, "reg", mem, ml))
 		return "cannot set /memory reg";
 
+	/*
+	 * One string: the kernel reads bootargs up to the first NUL. LK's
+	 * fdt_appendprop_string is Qualcomm's, which turns the old NUL into a
+	 * space; a plain string list ("own\0image ...\0") left 4.4 kernels
+	 * (whose msm8996 DTB has bootargs of its own) with only the DTB's part:
+	 * no androidboot.*, no panel.
+	 */
 	static char args[2048];
-	uint32_t al = 0, ol;
+	uint32_t ol;
 	int chosen = fdtw_node(w, "chosen");
 	if (chosen < 0)
 		return "image DTB has no /chosen node";
 	const char *own = fdtw_getprop(w, chosen, "bootargs", &ol);
-	if (own && ol) {
-		if (ol > 1024)
-			return "image DTB bootargs too long";
-		copy(args, own, ol);
-		al = ol;
-		if (args[al - 1])
-			args[al++] = 0;
-	}
-	char *app = args + al;
+	if (own && ol > 1024)
+		return "image DTB bootargs too long";
+	char *app = args;
 	uint32_t an = 0;
-	an = add_tokens(app, an, (uint32_t)sizeof(args) - al, (const char *)h + 64, 512, 0);
-	an = add_tokens(app, an, (uint32_t)sizeof(args) - al, (const char *)h + 608, 1024, 0);
+	if (own && ol)
+		an = add_tokens(app, an, (uint32_t)sizeof(args), own, ol, 0);
+	an = add_tokens(app, an, (uint32_t)sizeof(args), (const char *)h + 64, 512, 0);
+	an = add_tokens(app, an, (uint32_t)sizeof(args), (const char *)h + 608, 1024, 0);
 	uint32_t xl = 0;
 	while (lk_extra[xl])
 		xl++;
-	an = add_tokens(app, an, (uint32_t)sizeof(args) - al, lk_extra, xl, 1);
+	an = add_tokens(app, an, (uint32_t)sizeof(args), lk_extra, xl, 1);
 	app[an++] = 0;
-	if (!fdtw_setprop(w, cap, chosen, "bootargs", args, al + an))
+	if (!fdtw_setprop(w, cap, chosen, "bootargs", args, an))
 		return "cannot set /chosen bootargs";
 	chosen = fdtw_node(w, "chosen");	/* offsets moved */
 
