@@ -22,7 +22,9 @@
 #   the newest xnu/out-*/xnu-kernel/kernel.development.sweet); only the
 #   shim matters for this test, the image is replaced afterwards.
 #   LOS_WAIT (default 900): seconds to wait for LineageOS or TWRP.
-#   LOS_SKIP_IMAGES=1: system and vendor are already the build's. A run that
+#   LOS_BASE=research/axon7/OLDNAME: the phone has that run's images; only
+#   the MiB blocks that differ are written (then the whole partition is
+#   checked). LOS_SKIP_IMAGES=1: system and vendor are already the build's. A run that
 #   stopped in TWRP goes on there when started again with the same NAME.
 set -euo pipefail
 src=$(realpath "$1") name=$2
@@ -93,11 +95,28 @@ sleep 5
 adb_settle() { adb shell 'while pidof dd >/dev/null; do sleep 1; done; sync' >/dev/null; }
 # partitions by name (TWRP sometimes has no by-name links)
 dev() { adb shell "for b in /sys/class/block/*; do grep -q '^PARTNAME=$1\$' \$b/uevent 2>/dev/null && echo /dev/block/\${b##*/}; done" | tr -d '\r' | head -1; }
-put() {	# FILE PARTNAME: stream, then compare what reads back
-	local f=$1 d n
+put() {	# FILE PARTNAME: stream (or only the MiB blocks that differ from LOS_BASE), then compare
+	local f=$1 d n base=
+	case $2 in system|vendor) base=${LOS_BASE:+$LOS_BASE/$(basename "$1")} ;; esac	# only these hold the base run's data
 	d=$(dev "$2"); [ -n "$d" ] || { echo "no partition $2" >&2; exit 1; }
 	n=$(stat -c %s "$f")
-	adb exec-in "dd of=$d bs=1048576 2>/dev/null" < "$f"
+	if [ -n "$base" ] && [ -f "$base" ] && [ "$(stat -c %s "$base")" = "$n" ]; then
+		# LOS_BASE: a run whose images are on the phone; adb in TWRP manages ~3.4 MB/s
+		python3 -I -c 'import sys
+a,b=open(sys.argv[1],"rb"),open(sys.argv[2],"rb"); i=0
+while True:
+    x,y=a.read(1<<20),b.read(1<<20)
+    if not x: break
+    if x!=y: print(i)
+    i+=1' "$f" "$base" > "$out/delta-$2"
+		echo "   $2: $(wc -l < "$out/delta-$2") MiB differ from $base"
+		while read -r i; do
+			dd if="$f" bs=1048576 skip="$i" count=1 2>/dev/null |
+				adb exec-in "dd of=$d bs=1048576 seek=$i count=1 conv=notrunc 2>/dev/null"
+		done < "$out/delta-$2"
+	else
+		adb exec-in "dd of=$d bs=1048576 2>/dev/null" < "$f"
+	fi
 	adb_settle
 	local a b
 	a=$(sha1sum < "$f" | cut -d' ' -f1)
