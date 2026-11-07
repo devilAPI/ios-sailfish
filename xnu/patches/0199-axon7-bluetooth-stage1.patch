@@ -48,7 +48,7 @@
  	printf("SAILFISH WLAN: chip in reset: clkreq in %u, wake in %u\n", rd(wl_clkreq, 4) & 1u, rd(wl_wake, 4) & 1u);
 --- /dev/null
 +++ b/bsd/dev/axon7_bt.c
-@@ -0,0 +1,1162 @@
+@@ -0,0 +1,1175 @@
 +/*
 + * ZTE Axon 7 Bluetooth, stage 1: bring up the Bluetooth half of the QCA6174
 + * ("ROME" 3.2: SoC 0x44, ROM 0x0302) on BLSP1 UART2 and test it from the
@@ -476,9 +476,22 @@
 +		 * after the rampatch's last acknowledgement): push them out as
 +		 * msm_poll_get_char_dm does; the stale event then counts them.
 +		 */
-+		if (!bt_forced && waited >= 1000 && ((rd(bt_uart, U_RXFS) >> 7) & 7u)) {
++		unsigned partial = (rd(bt_uart, U_RXFS) >> 7) & 7u;
++		if (waited >= 1000 && partial) {
++			/*
++			 * As msm_poll_get_char_dm: the packing buffer's count from
++			 * RXFS, FORCE_STALE puts the word into the FIFO (no stale
++			 * event follows, test boot 5), read it at once.
++			 */
 +			wr(bt_uart, U_CR, CR_FORCE_STALE);
++			for (unsigned t = 0; t < 100 && !(rd(bt_uart, U_SR) & SR_RX_READY); t++) {
++				delay(1);
++			}
++			uint32_t w = rd(bt_uart, U_RF);
++			bt_slop = w << (8 * (4 - partial));
++			bt_slop_n = partial;
 +			bt_forced = true;
++			bt_rx_rearm();
 +			continue;
 +		}
 +		if (waited >= timeout_us) {
