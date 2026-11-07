@@ -22,6 +22,8 @@
 #   the newest xnu/out-*/xnu-kernel/kernel.development.sweet); only the
 #   shim matters for this test, the image is replaced afterwards.
 #   LOS_WAIT (default 900): seconds to wait for LineageOS or TWRP.
+#   LOS_SKIP_IMAGES=1: system and vendor are already the build's. A run that
+#   stopped in TWRP goes on there when started again with the same NAME.
 set -euo pipefail
 src=$(realpath "$1") name=$2
 cd "$(dirname "$0")/.."
@@ -48,6 +50,14 @@ done
 python3 -I tools/axon7-androidimg.py convert "$src/boot.img" -o "$out/los-boot.img"
 python3 -I tools/axon7-androidimg.py check "$out/los-boot.img"
 
+resume=0
+if [ "$(adb get-state 2>/dev/null)" = recovery ] && [ -s "$out/boot-before.img" ] && [ -s "$out/misc-before.bin" ] && [ -s "$out/misc-blocks" ]; then
+	resume=1	# a run of this NAME stopped in TWRP: go on from there
+fi
+if [ $resume = 1 ]; then
+	say "resuming in TWRP with the saved boot and boot-menu block"
+	misc_blocks=$(cat "$out/misc-blocks")
+else
 say "saving boot and the boot-menu block from postmarketOS"
 on true || { echo "postmarketOS not reachable as $host" >&2; exit 1; }
 root 'dd if=/dev/disk/by-partlabel/boot bs=1M 2>/dev/null' > "$out/boot-before.img"
@@ -56,6 +66,8 @@ python3 -I tools/axon7-dualboot.py extract "$out/boot-before.img" -o "$out/pmos.
 misc_blocks=$(( $(root 'blockdev --getsize64 /dev/disk/by-partlabel/misc') / 4096 ))
 root "dd if=/dev/disk/by-partlabel/misc bs=4096 skip=$((misc_blocks - 1)) count=1 2>/dev/null" > "$out/misc-before.bin"
 [ "$(stat -c %s "$out/misc-before.bin")" = 4096 ] || { echo "could not read the misc block" >&2; exit 1; }
+echo "$misc_blocks" > "$out/misc-blocks"
+fi
 python3 -I -c 'import struct,sys; sys.stdout.buffer.write((b"AX7BOOT1"+struct.pack("<III",2,1,2^0xa5a5a5a5)).ljust(4096,b"\0"))' > "$out/misc-los.bin"
 
 say "test shim image (LOS_TEST=1)"
@@ -63,8 +75,10 @@ LOS_TEST=1 WDT_SECS=0 BUILD_ONLY=1 PMOS_BUNDLE="$out/pmos.bundle" \
 	tools/axon7-cycle.sh "$kernel" "$name" "$(cat tools/axon7-bootargs.txt)" >/dev/null
 python3 -I tools/axon7-dualboot.py check "$out/boot.img" >/dev/null
 
-say "postmarketOS -> TWRP"
-root 'systemctl reboot --reboot-argument=recovery' >/dev/null 2>&1 || true
+if [ $resume = 0 ]; then
+	say "postmarketOS -> TWRP"
+	root 'systemctl reboot --reboot-argument=recovery' >/dev/null 2>&1 || true
+fi
 waitfor() {	# adb state: recovery or device
 	local want=$1 secs=$2 t=0
 	while [ $t -lt "$secs" ]; do
@@ -75,6 +89,8 @@ waitfor() {	# adb state: recovery or device
 }
 waitfor recovery 300 || { echo "no TWRP on adb after 300 s" >&2; exit 3; }
 sleep 5
+# exec-in returns when this side is done sending, dd on the phone may still write
+adb_settle() { adb shell 'while pidof dd >/dev/null; do sleep 1; done; sync' >/dev/null; }
 # partitions by name (TWRP sometimes has no by-name links)
 dev() { adb shell "for b in /sys/class/block/*; do grep -q '^PARTNAME=$1\$' \$b/uevent 2>/dev/null && echo /dev/block/\${b##*/}; done" | tr -d '\r' | head -1; }
 put() {	# FILE PARTNAME: stream, then compare what reads back
@@ -82,6 +98,7 @@ put() {	# FILE PARTNAME: stream, then compare what reads back
 	d=$(dev "$2"); [ -n "$d" ] || { echo "no partition $2" >&2; exit 1; }
 	n=$(stat -c %s "$f")
 	adb exec-in "dd of=$d bs=1048576 2>/dev/null" < "$f"
+	adb_settle
 	local a b
 	a=$(sha1sum < "$f" | cut -d' ' -f1)
 	b=$(adb exec-out "head -c $n $d | sha1sum" | cut -d' ' -f1)
@@ -91,12 +108,15 @@ put() {	# FILE PARTNAME: stream, then compare what reads back
 putblk() {	# FILE: the last block of misc
 	local d; d=$(dev misc)
 	adb exec-in "dd of=$d bs=4096 seek=$((misc_blocks - 1)) 2>/dev/null" < "$1"
+	adb_settle
 	[ "$(adb exec-out "dd if=$d bs=4096 skip=$((misc_blocks - 1)) count=1 2>/dev/null" | sha1sum)" = "$(sha1sum < "$1")" ] ||
 		{ echo "misc block does not read back" >&2; exit 1; }
 }
 say "TWRP: writing system, vendor, los_boot, test boot, boot menu"
-put "$out/system.raw" system
-put "$out/vendor.raw" vendor
+if [ "${LOS_SKIP_IMAGES:-0}" != 1 ]; then	# LOS_SKIP_IMAGES=1: system and vendor are current
+	put "$out/system.raw" system
+	put "$out/vendor.raw" vendor
+fi
 put "$out/los-boot.img" los_boot
 put "$out/boot.img" boot
 putblk "$out/misc-los.bin"
