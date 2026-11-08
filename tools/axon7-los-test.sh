@@ -202,8 +202,9 @@ DSPP
 		timeout "$LOS_HOLD" adb logcat -b all -v threadtime > "logs/$name-live.txt" 2>&1 || true
 		kill "$bl" "$wk" 2>/dev/null || true
 		adb shell 'dmesg' > "logs/$name-dmesg-hold.txt" 2>&1 || true
-		state=$(adb get-state 2>/dev/null || true)
-		echo "   adb state after the hold: ${state:-none}"
+		# state stays "device": if adb is gone now, the next block waits for
+		# TWRP or postmarketOS (a test-build panic resets into postmarketOS)
+		echo "   adb state after the hold: $(adb get-state 2>/dev/null || echo none)"
 	fi
 fi
 if [ "$state" = device ] && [ "$(adb get-state 2>/dev/null || true)" != device ]; then
@@ -293,7 +294,13 @@ say "TWRP: kernel log of the LineageOS boot, restoring boot and the boot menu"
 adb shell 'mount -t pstore pstore /sys/fs/pstore 2>/dev/null; ls -1 /sys/fs/pstore' | tr -d '\r' | while read -r f; do
 	[ -n "$f" ] && adb exec-out "cat /sys/fs/pstore/$f" > "logs/$name-pstore-$f.txt"
 done
-# reference: the same display registers on TWRP's ZTE 3.18 kernel (whose
+# axon7-testlog.sh (test builds): props, dmesg, logcat of a boot that got to post-fs
+md=$(dev los_metadata)
+[ -n "$md" ] && adb exec-out "head -c 16777216 $md" | strings -n 4 > "logs/$name-testlog.txt"
+put "$out/boot-before.img" boot
+putblk "$out/misc-before.bin"
+# reference: the same display registers on TWRP's ZTE 3.18 kernel (after the restore: should
+# TWRP crash, the phone boots the normal menu; its
 # wake-up does not show the half-screen colour bug), before and after a blank
 adb push tools/axon7-mdss-regs.sh /tmp/regs.sh >/dev/null 2>&1 && adb shell '
 	mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null
@@ -301,11 +308,6 @@ adb push tools/axon7-mdss-regs.sh /tmp/regs.sh >/dev/null 2>&1 && adb shell '
 	echo "== twrp-before"; sh /tmp/regs.sh $d
 	echo 1 > /sys/class/graphics/fb0/blank; sleep 3; echo 0 > /sys/class/graphics/fb0/blank; sleep 3
 	echo "== twrp-after-unblank"; sh /tmp/regs.sh $d' > "logs/$name-twrp-regs.txt" 2>&1 || true
-# axon7-testlog.sh (test builds): props, dmesg, logcat of a boot that got to post-fs
-md=$(dev los_metadata)
-[ -n "$md" ] && adb exec-out "head -c 16777216 $md" | strings -n 4 > "logs/$name-testlog.txt"
-put "$out/boot-before.img" boot
-putblk "$out/misc-before.bin"
 adb reboot
 say "back to postmarketOS"
 for i in $(seq 1 60); do on true 2>/dev/null && break; sleep 5; done

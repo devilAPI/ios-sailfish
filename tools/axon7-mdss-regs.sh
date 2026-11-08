@@ -1,7 +1,8 @@
 #!/system/bin/sh
 # Display register snapshot for the half-screen colour bug (both kernels:
 # LineageOS 4.4 and TWRP's ZTE 3.18). Usage: sh regs.sh <mdss debugfs dir>
-# Prints only non-zero lines. DSPP0 = left half, DSPP1 = right half;
+# Prints only non-zero lines. DSPP +0x1800..0x1fff is not read: reading
+# DSPP0 0x56800 took the 4.4 kernel down (synchronous abort, los27). DSPP0 = left half, DSPP1 = right half;
 # dsi0 = left, dsi1 = right.
 d=${1:-/sys/kernel/debug/mdp}
 f=mdp_; [ -e $d/mdp_off ] || f=
@@ -12,7 +13,7 @@ dump() { # file-prefix offset count(hex) label
 }
 for b in 55000 57000; do
 	o=$b
-	while [ $((0x$o)) -lt $((0x$b + 0x2000)) ]; do
+	while [ $((0x$o)) -lt $((0x$b + 0x1800)) ]; do
 		dump "$f" $o 400 "dspp 0x$o"
 		o=$(printf %x $((0x$o + 0x400)))
 	done
