@@ -190,12 +190,12 @@ if [ "$state" = device ]; then
 		cat > "$out/dspp.sh" <<'DSPP'
 d=/sys/kernel/debug/mdp; [ -d $d ] || d=/sys/kernel/debug/mdss_mdp
 echo "== $1 $(date +%T) wake=$(dumpsys power | grep -m1 -o 'mWakefulness=[A-Za-z]*') ppd=$(getprop init.svc.ppd) dir=$d"
-f=mdp_; [ -e $d/mdp_off ] || f=
-for o in 55000 57000 56700 58700 79000 79800; do
-	echo "$o 40" > $d/${f}off 2>/dev/null && { echo "-- 0x$o"; cat $d/${f}reg 2>&1 | head -6; }
-done
+sh /data/local/tmp/regs.sh $d
 DSPP
 		adb push "$out/dspp.sh" /data/local/tmp/dspp.sh >/dev/null 2>&1 || true
+		adb push tools/axon7-mdss-regs.sh /data/local/tmp/regs.sh >/dev/null 2>&1 || true
+		# which input device sends KEY_POWER (phantom power key presses)
+		( timeout "$LOS_HOLD" adb shell 'getevent -lt' > "logs/$name-getevent.txt" 2>&1 ) &
 		( sleep 60
 		  adb shell 'sh /data/local/tmp/dspp.sh before; input keyevent KEYCODE_SLEEP; sleep 15; input keyevent KEYCODE_WAKEUP; sleep 10; sh /data/local/tmp/dspp.sh after-wake; setprop ctl.stop ppd; sleep 3; input keyevent KEYCODE_SLEEP; sleep 15; input keyevent KEYCODE_WAKEUP; sleep 10; sh /data/local/tmp/dspp.sh after-wake-no-ppd; setprop ctl.start ppd; sleep 5; input keyevent KEYCODE_SLEEP; sleep 15; input keyevent KEYCODE_WAKEUP; sleep 10; sh /data/local/tmp/dspp.sh after-wake-ppd-again' > "logs/$name-dspp.txt" 2>&1 ) &
 		wk=$!
@@ -256,10 +256,13 @@ if [ "$state" = device ]; then
 	# camera: restart the daemon and the provider with HAL debug logging (root)
 	adb shell '
 		setprop persist.camera.hal.debug 4; setprop persist.camera.global.debug 4; setprop persist.camera.mct.debug 4
+		setprop persist.camera.sensor.debug 4; setprop persist.camera.eeprom.debug 4; setprop persist.camera.isp.debug 2
+		setprop persist.vendor.camera.hal.debug 4; setprop persist.vendor.camera.global.debug 4; setprop persist.vendor.camera.sensor.debug 4
 		logcat -c
 		stop vendor.camera-provider-2-4; stop qcamerasvr; sleep 1; start qcamerasvr; sleep 3; start vendor.camera-provider-2-4; sleep 8
 		dumpsys media.camera | grep -iE "Number of camera|Camera [0-9]" 
-		logcat -d -b all -v threadtime | grep -iE "camera|mm-qcamera|mct|sensor|eeprom|QCamera|cam_" | head -400
+		logcat -d -b all -v threadtime | grep -vE "avc:  denied|print_matrix|pdafgain" | grep -iE "camera|mm-qcamera|mct|sensor|eeprom|QCamera|cam_|chromatix" > /data/local/tmp/camdbg.txt; wc -l /data/local/tmp/camdbg.txt; head -1500 /data/local/tmp/camdbg.txt
+		echo "== sensor kernel"; dmesg | grep -iE "msm_sensor|sensor_config|s5k2t8|ov8856|power_up|power_down|cci" | tail -60
 		dmesg | grep -iE "msm_sensor|eeprom|actuator|cci|camera|cam_|csid|csiphy|ispif|vfe|cpp" | tail -80
 		echo "== camera nodes"; ls -lZ /dev/media* /dev/video* /dev/v4l-subdev* 2>&1 | head -60
 		for v in /sys/class/video4linux/*; do echo "$v $(cat $v/name)"; done
@@ -290,6 +293,14 @@ say "TWRP: kernel log of the LineageOS boot, restoring boot and the boot menu"
 adb shell 'mount -t pstore pstore /sys/fs/pstore 2>/dev/null; ls -1 /sys/fs/pstore' | tr -d '\r' | while read -r f; do
 	[ -n "$f" ] && adb exec-out "cat /sys/fs/pstore/$f" > "logs/$name-pstore-$f.txt"
 done
+# reference: the same display registers on TWRP's ZTE 3.18 kernel (whose
+# wake-up does not show the half-screen colour bug), before and after a blank
+adb push tools/axon7-mdss-regs.sh /tmp/regs.sh >/dev/null 2>&1 && adb shell '
+	mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null
+	d=/sys/kernel/debug/mdp; [ -d $d ] || d=/sys/kernel/debug/mdss_mdp
+	echo "== twrp-before"; sh /tmp/regs.sh $d
+	echo 1 > /sys/class/graphics/fb0/blank; sleep 3; echo 0 > /sys/class/graphics/fb0/blank; sleep 3
+	echo "== twrp-after-unblank"; sh /tmp/regs.sh $d' > "logs/$name-twrp-regs.txt" 2>&1 || true
 # axon7-testlog.sh (test builds): props, dmesg, logcat of a boot that got to post-fs
 md=$(dev los_metadata)
 [ -n "$md" ] && adb exec-out "head -c 16777216 $md" | strings -n 4 > "logs/$name-testlog.txt"
