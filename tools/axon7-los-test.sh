@@ -173,10 +173,12 @@ done
 echo "   adb state: ${state:-none} after ${t}s"
 if [ "$state" = device ]; then
 	say "LineageOS is up"
-	adb root >/dev/null 2>&1 || true
+	timeout 30 adb root >/dev/null 2>&1 || true
 	sleep 5
-	adb wait-for-device
-	for i in $(seq 1 60); do [ "$(adb shell getprop sys.boot_completed | tr -d '\r')" = 1 ] && break; sleep 5; done
+	# a panic right after boot (hard reset, the test shim's TWRP mark is lost)
+	# ends in postmarketOS: never wait for adb without a limit
+	timeout 120 adb wait-for-device || true
+	for i in $(seq 1 60); do [ "$(timeout 20 adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = 1 ] && break; [ "$(adb get-state 2>/dev/null || true)" = device ] || break; sleep 5; done
 	if [ "${LOS_HOLD:-0}" -gt 0 ]; then
 		say "keeping LineageOS up for ${LOS_HOLD} s, logcat streamed to logs/$name-live.txt"
 		( while adb shell 'echo $(date +%T) backlight=$(cat /sys/class/leds/lcd-backlight/brightness) $(dumpsys power | grep -m1 -o "mWakefulness=[A-Za-z]*")' 2>&1 | tr -d '\r'; do sleep 30; done ) > "logs/$name-backlight.txt" &
@@ -238,6 +240,10 @@ if [ "$state" = device ]; then
 		echo "== bluetooth"; dumpsys bluetooth_manager | grep -iE "enabled|state:|name:" | head -6
 		echo "== sensors"; dumpsys sensorservice | grep -E "^[0-9a-fx]+\)|Total [0-9]+ h/w sensors" | head -30
 		echo "== audio"; dumpsys media.audio_flinger | grep -iE "Output thread|Input thread|HAL|hw module|primary" | head -10
+		echo "== nfc"; dumpsys nfc 2>&1 | grep -iE "mState|state=|enabled|mIsNfc|NfcService" | head -8
+		echo "== sound cards"; cat /proc/asound/cards; ls /dev/snd | head -40 | tr "\n" " "; echo
+		echo "== vibrator"; dumpsys vibrator_manager 2>&1 | grep -iE "hal|capabilit|vibrator id|isVibrating" | head -6; cmd vibrator_manager synced -f oneshot 150 2>&1 | head -2; dmesg | grep -iE "haptic|vibrat" | tail -4
+		echo "== torch"; cmd media.camera 2>/dev/null | head -1; for t in /sys/class/leds/torch-light0 /sys/class/leds/led:torch_0; do [ -e $t/brightness ] && { echo 50 > $t/brightness; sleep 1; echo "$t $(cat $t/brightness)"; echo 0 > $t/brightness; }; done
 		echo "== failing services"; getprop | grep -E "init.svc.*\[(restarting|stopped)\]"
 		echo "== sysfs paths"; ls -l /sys/class/rfkill/ /sys/class/power_supply/ /sys/class/leds/ 2>&1 | grep -- "->"; ls -Z /sys/class/rfkill/*/state /sys/class/power_supply/*/type 2>&1
 	' > "logs/$name-hw.txt" 2>&1 || true
