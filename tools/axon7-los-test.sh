@@ -221,6 +221,41 @@ if [ "$state" = device ]; then
 	adb shell 'dmesg' > "logs/$name-dmesg.txt" 2>&1 || true
 	adb logcat -d -b all > "logs/$name-logcat.txt" 2>&1 || true
 	adb exec-out 'screencap -p' > "logs/$name-screen.png" 2>/dev/null || true
+	# hardware: modem (no SIM needed: baseband, IMEI, radio power, emergency-only
+	# registration, signal), GPS, camera, fingerprint, Wi-Fi, sensors, audio
+	adb shell '
+		echo "== modem subsystem"; for s in /sys/bus/msm_subsys/devices/*; do echo "$(cat $s/name 2>/dev/null) $(cat $s/state 2>/dev/null)"; done
+		echo "== radio props"; getprop | grep -E "gsm\.|ril\.|vendor.radio|persist.radio.multisim|baseband"
+		echo "== rild"; ps -A -o PID,NAME | grep -E "rild|qmuxd|pm-service|per_mgr|netmgrd|cnd|ims"
+		echo "== radio services"; service list | grep -iE "radio|ims|telephony" | head -40
+		echo "== telephony.registry"; dumpsys telephony.registry | grep -E "mServiceState|mSignalStrength|mDataConnectionState|mCallState|mPhoneCapability" | head -20
+		echo "== phone"; dumpsys phone | grep -iE "imei|baseband|mRadioState|RadioPowerState|isRadioOn|mServiceState" | head -20
+		echo "== imei"; service call iphonesubinfo 1 s16 com.android.shell 2>&1 | head -5
+		echo "== gnss"; dumpsys location | grep -iE "gnss|gps" | head -15
+		echo "== camera"; dumpsys media.camera | grep -iE "Number of camera|Camera [0-9]|facing|error|Device [0-9]" | head -15
+		echo "== fingerprint"; dumpsys fingerprint | head -15
+		echo "== wifi"; dumpsys wifi | grep -iE "Wi-Fi is|mWifiState|supplicant state|interface" | head -10; ip link | grep -E "wlan|p2p"
+		echo "== bluetooth"; dumpsys bluetooth_manager | grep -iE "enabled|state:|name:" | head -6
+		echo "== sensors"; dumpsys sensorservice | grep -E "^[0-9a-fx]+\)|Total [0-9]+ h/w sensors" | head -30
+		echo "== audio"; dumpsys media.audio_flinger | grep -iE "Output thread|Input thread|HAL|hw module|primary" | head -10
+		echo "== failing services"; getprop | grep -E "init.svc.*\[(restarting|stopped)\]"
+		echo "== sysfs paths"; ls -l /sys/class/rfkill/ /sys/class/power_supply/ /sys/class/leds/ 2>&1 | grep -- "->"; ls -Z /sys/class/rfkill/*/state /sys/class/power_supply/*/type 2>&1
+	' > "logs/$name-hw.txt" 2>&1 || true
+	# camera: restart the daemon and the provider with HAL debug logging (root)
+	adb shell '
+		setprop persist.camera.hal.debug 4; setprop persist.camera.global.debug 4; setprop persist.camera.mct.debug 4
+		logcat -c
+		stop vendor.camera-provider-2-4; stop qcamerasvr; sleep 1; start qcamerasvr; sleep 3; start vendor.camera-provider-2-4; sleep 8
+		dumpsys media.camera | grep -iE "Number of camera|Camera [0-9]" 
+		logcat -d -b all -v threadtime | grep -iE "camera|mm-qcamera|mct|sensor|eeprom|QCamera|cam_" | head -400
+		dmesg | grep -iE "msm_sensor|eeprom|actuator|cci|camera|cam_|csid|csiphy|ispif|vfe|cpp" | tail -80
+		echo "== camera nodes"; ls -lZ /dev/media* /dev/video* /dev/v4l-subdev* 2>&1 | head -60
+		for v in /sys/class/video4linux/*; do echo "$v $(cat $v/name)"; done
+		p=$(pidof android.hardware.camera.provider@2.4-service_64 android.hardware.camera.provider@2.4-service | head -1)
+		echo "== provider pid $p"; grep -E "camera|mmcamera|mm-camera" /proc/$p/maps 2>/dev/null | awk "{print \$6}" | sort -u
+		echo "== provider log"; logcat -d -b all -v threadtime --pid=$p | tail -150
+		echo "== cameraserver"; logcat -d -b all -v threadtime | grep -iE "CameraProviderManager|CameraService|HidlProviderInfo" | tail -40
+	' > "logs/$name-camera.txt" 2>&1 || true
 	echo "   boot_completed=$(adb shell getprop sys.boot_completed | tr -d '\r')"
 	adb reboot recovery
 	waitfor recovery 300 || { echo "LineageOS did not reboot to TWRP" >&2; exit 3; }
