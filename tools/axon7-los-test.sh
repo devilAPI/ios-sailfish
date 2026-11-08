@@ -242,11 +242,17 @@ if [ "$state" = device ]; then
 		echo "== audio"; dumpsys media.audio_flinger | grep -iE "Output thread|Input thread|HAL|hw module|primary" | head -10
 		echo "== nfc"; dumpsys nfc 2>&1 | grep -iE "mState|state=|enabled|mIsNfc|NfcService" | head -8
 		echo "== sound cards"; cat /proc/asound/cards; ls /dev/snd | head -40 | tr "\n" " "; echo
+		echo "== asoc"; for f in platforms codecs dais; do echo "-- $f"; cat /sys/kernel/debug/asoc/$f 2>&1 | tr "\n" " "; echo; done
 		echo "== vibrator"; dumpsys vibrator_manager 2>&1 | grep -iE "hal|capabilit|vibrator id|isVibrating" | head -6; cmd vibrator_manager synced -f oneshot 150 2>&1 | head -2; dmesg | grep -iE "haptic|vibrat" | tail -4
 		echo "== torch"; cmd media.camera 2>/dev/null | head -1; for t in /sys/class/leds/torch-light0 /sys/class/leds/led:torch_0; do [ -e $t/brightness ] && { echo 50 > $t/brightness; sleep 1; echo "$t $(cat $t/brightness)"; echo 0 > $t/brightness; }; done
 		echo "== failing services"; getprop | grep -E "init.svc.*\[(restarting|stopped)\]"
 		echo "== sysfs paths"; ls -l /sys/class/rfkill/ /sys/class/power_supply/ /sys/class/leds/ 2>&1 | grep -- "->"; ls -Z /sys/class/rfkill/*/state /sys/class/power_supply/*/type 2>&1
 	' > "logs/$name-hw.txt" 2>&1 || true
+	# camera: open the camera app for a preview (screenshot) and keep the HAL log of it
+	adb shell 'svc power stayon true; input keyevent KEYCODE_WAKEUP; sleep 2; wm dismiss-keyguard; sleep 1; logcat -b all -c; am start -W -n org.lineageos.aperture/.CameraLauncher 2>&1 || am start -W -a android.media.action.STILL_IMAGE_CAMERA 2>&1; sleep 12; dumpsys activity activities | grep -m3 -E "mResumedActivity|topResumedActivity"' > "logs/$name-camera-start.txt" 2>&1 || true
+	adb exec-out 'screencap -p' > "logs/$name-camera-preview.png" 2>/dev/null || true
+	adb shell 'dumpsys media.camera' > "logs/$name-camera-dump.txt" 2>&1 || true
+	adb shell 'logcat -d -b all -v threadtime | grep -vE "avc:  denied" | grep -iE "QCamera|CameraDevice|Camera3-|CameraService|mm-camera|aperture|CameraProvider|AndroidRuntime" | tail -200; input keyevent KEYCODE_HOME; svc power stayon false' > "logs/$name-camera-open.txt" 2>&1 || true
 	# camera: restart the daemon and the provider with HAL debug logging (root)
 	adb shell '
 		setprop persist.camera.hal.debug 4; setprop persist.camera.global.debug 4; setprop persist.camera.mct.debug 4
@@ -267,6 +273,12 @@ if [ "$state" = device ]; then
 	waitfor recovery 300 || { echo "LineageOS did not reboot to TWRP" >&2; exit 3; }
 elif [ "$state" = pmos ]; then
 	say "LineageOS restarted into postmarketOS: to TWRP for the logs and the restore"
+	# a panic restart is a hard reset into postmarketOS; its systemd-pstore has
+	# moved the LineageOS crash record (dmesg-ramoops-*) to /var/lib/systemd/pstore
+	for f in $(root 'ls -1 /var/lib/systemd/pstore' 2>/dev/null); do
+		root "cat /var/lib/systemd/pstore/$f" > "logs/$name-pmos-pstore-$f.txt" 2>/dev/null || true
+	done
+	root 'rm -f /var/lib/systemd/pstore/*' >/dev/null 2>&1 || true
 	root 'systemctl reboot --reboot-argument=recovery' >/dev/null 2>&1 || true
 	waitfor recovery 300 || { echo "no TWRP on adb after 300 s" >&2; exit 3; }
 elif [ "$state" != recovery ]; then
