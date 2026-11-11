@@ -170,8 +170,20 @@ say "TWRP: writing system, vendor, los_boot, test boot, boot menu"
 if [ "${LOS_SKIP_IMAGES:-0}" != 1 ] && [ $super = 1 ]; then
 	# data chunks of the sparse super image only, each read back (sha1)
 	d=$(dev system); [ -n "$d" ] || { echo "no partition system" >&2; exit 1; }
-	python3 -I tools/axon7-simg-put.py "$src/super.img" "$d" ||
+	# research/axon7/super-on-phone: the super.img last written and verified
+	# (path, sha256); with it only the changed MiB are written (the full check
+	# that follows catches a phone that holds something else, then rewrites all)
+	rec=research/axon7/super-on-phone base=()
+	if [ -s "$rec" ]; then
+		read -r bpath bsum < "$rec"
+		if [ -f "$bpath" ] && [ "$(sha256sum < "$bpath" | cut -d' ' -f1)" = "$bsum" ]; then
+			base=(--base "$bpath")
+		fi
+	fi
+	rm -f "$rec"
+	python3 -I tools/axon7-simg-put.py "$src/super.img" "$d" "${base[@]}" ||
 		{ echo "super.img -> $d failed" >&2; exit 1; }
+	echo "$src/super.img $(sha256sum < "$src/super.img" | cut -d' ' -f1)" > "$rec"	# keep that file for the next run
 	echo "   super.img -> system ($d) written and verified"
 	# a new install: 22.2's (or an older 24's) metadata and FBE data are no use
 	for p in los_metadata:16 los_data:64; do
