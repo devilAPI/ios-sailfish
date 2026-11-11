@@ -31,6 +31,10 @@
 #   restore its saved boot and boot menu, collect pstore, reboot (no boot test).
 #   LOS_ACTIVE_HW=1: also buzz the vibrator and blink the torch (off by default:
 #   tests stay quiet).
+#   LOS_SETTLE=SECONDS (default 300): after boot_completed, wait up to that
+#   long for the boot animation to stop and an activity to be resumed before
+#   collecting (SwiftShader renders on the CPU: the first boot's boot
+#   animation outlasted boot_completed, M1a run 14).
 #   LOS_HOLD=SECONDS: keep LineageOS up that long after boot_completed with
 #   logcat streamed to logs/NAME-live.txt (catches a later shutdown/restart).
 #   LOS_INSTALL=1: install instead of a test: system, vendor and los_boot
@@ -225,6 +229,15 @@ if [ "$state" = device ]; then
 	# ends in postmarketOS: never wait for adb without a limit
 	timeout 120 adb wait-for-device || true
 	for i in $(seq 1 60); do [ "$(timeout 20 adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = 1 ] && break; [ "$(adb get-state 2>/dev/null || true)" = device ] || break; sleep 5; done
+	settle=${LOS_SETTLE:-300} t0=$SECONDS
+	while [ $((SECONDS - t0)) -lt "$settle" ]; do
+		[ "$(adb get-state 2>/dev/null || true)" = device ] || break
+		[ "$(timeout 20 adb shell getprop init.svc.bootanim 2>/dev/null | tr -d '\r')" = running ] || \
+			{ timeout 20 adb shell dumpsys activity activities 2>/dev/null | grep -q 'mResumedActivity\|ResumedActivity:' && break; }
+		sleep 10
+	done
+	sleep 15	# let the first frame of the resumed activity reach the screen
+	say "settled after $((SECONDS - t0)) s: $(timeout 20 adb shell dumpsys activity activities 2>/dev/null | grep -m1 -o 'ResumedActivity:.*' | tr -d '\r')"
 	if [ "${LOS_HOLD:-0}" -gt 0 ]; then
 		say "keeping LineageOS up for ${LOS_HOLD} s, logcat streamed to logs/$name-live.txt"
 		( while adb shell 'echo $(date +%T) backlight=$(cat /sys/class/leds/lcd-backlight/brightness) $(dumpsys power | grep -m1 -o "mWakefulness=[A-Za-z]*")' 2>&1 | tr -d '\r'; do sleep 30; done ) > "logs/$name-backlight.txt" &
