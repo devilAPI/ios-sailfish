@@ -27,6 +27,10 @@
 #   the newest xnu/out-*/xnu-kernel/kernel.development.sweet); only the
 #   shim matters for this test, the image is replaced afterwards.
 #   LOS_WAIT (default 900): seconds to wait for LineageOS or TWRP.
+#   LOS_RESTORE=1: phone in TWRP after a run of NAME (stopped by hand): only
+#   restore its saved boot and boot menu, collect pstore, reboot (no boot test).
+#   LOS_ACTIVE_HW=1: also buzz the vibrator and blink the torch (off by default:
+#   tests stay quiet).
 #   LOS_HOLD=SECONDS: keep LineageOS up that long after boot_completed with
 #   logcat streamed to logs/NAME-live.txt (catches a later shutdown/restart).
 #   LOS_INSTALL=1: install instead of a test: system, vendor and los_boot
@@ -65,8 +69,19 @@ done
 python3 -I tools/axon7-androidimg.py convert "$src/boot.img" -o "$out/los-boot.img"
 python3 -I tools/axon7-androidimg.py check "$out/los-boot.img"
 
+if [ "${LOS_RESTORE:-0}" = 1 ]; then
+	# LOS_RESTORE=1: the phone is in TWRP after a run of this NAME; only write back
+	# its saved boot and boot-menu block, then reboot (never boots LineageOS)
+	[ "$(adb get-state 2>/dev/null)" = recovery ] || { echo "LOS_RESTORE: phone not in TWRP" >&2; exit 1; }
+	python3 -I tools/axon7-dualboot.py extract "$out/boot-before.img" -o "$out/pmos.bundle" >/dev/null ||
+		{ echo "LOS_RESTORE: $out/boot-before.img has no postmarketOS bundle" >&2; exit 1; }
+	misc_blocks=$(cat "$out/misc-blocks")
+	LOS_RESTORE_ONLY=1
+fi
 resume=0
-if [ "$(adb get-state 2>/dev/null)" = recovery ] && [ -s "$out/boot-before.img" ] && [ -s "$out/misc-before.bin" ] && [ -s "$out/misc-blocks" ]; then
+if [ "${LOS_RESTORE_ONLY:-0}" = 1 ]; then
+	resume=1	# restore only: nothing is saved again
+elif [ "$(adb get-state 2>/dev/null)" = recovery ] && [ -s "$out/boot-before.img" ] && [ -s "$out/misc-before.bin" ] && [ -s "$out/misc-blocks" ]; then
 	resume=1	# a run of this NAME stopped in TWRP: go on from there
 elif [ "${LOS_INSTALL:-0}" = 1 ] && [ "$(adb get-state 2>/dev/null)" = recovery ]; then
 	resume=1	# install from TWRP: boot and misc are not touched
@@ -89,7 +104,7 @@ fi
 python3 -I -c 'import struct,sys; sys.stdout.buffer.write((b"AX7BOOT1"+struct.pack("<III",2,1,2^0xa5a5a5a5)).ljust(4096,b"\0"))' > "$out/misc-los.bin"
 
 install=${LOS_INSTALL:-0}
-if [ "$install" != 1 ]; then
+if [ "$install" != 1 ] && [ "${LOS_RESTORE_ONLY:-0}" != 1 ]; then
 say "test shim image (LOS_TEST=1)"
 LOS_TEST=1 WDT_SECS=0 BUILD_ONLY=1 PMOS_BUNDLE="$out/pmos.bundle" \
 	tools/axon7-cycle.sh "$kernel" "$name" "$(cat tools/axon7-bootargs.txt)" >/dev/null
@@ -150,6 +165,7 @@ putblk() {	# FILE: the last block of misc
 	[ "$(adb exec-out "dd if=$d bs=4096 skip=$((misc_blocks - 1)) count=1 2>/dev/null" | sha1sum)" = "$(sha1sum < "$1")" ] ||
 		{ echo "misc block does not read back" >&2; exit 1; }
 }
+if [ "${LOS_RESTORE_ONLY:-0}" != 1 ]; then
 say "TWRP: writing system, vendor, los_boot, test boot, boot menu"
 if [ "${LOS_SKIP_IMAGES:-0}" != 1 ] && [ $super = 1 ]; then
 	# data chunks of the sparse super image only, each read back (sha1)
@@ -262,8 +278,11 @@ if [ "$state" = device ]; then
 		echo "== nfc"; dumpsys nfc 2>&1 | grep -iE "mState|state=|enabled|mIsNfc|NfcService" | head -8
 		echo "== sound cards"; cat /proc/asound/cards; ls /dev/snd | head -40 | tr "\n" " "; echo
 		echo "== asoc"; for f in platforms codecs dais; do echo "-- $f"; cat /sys/kernel/debug/asoc/$f 2>&1 | tr "\n" " "; echo; done
-		echo "== vibrator"; dumpsys vibrator_manager 2>&1 | grep -iE "hal|capabilit|vibrator id|isVibrating" | head -6; cmd vibrator_manager synced -f oneshot 150 2>&1 | head -2; dmesg | grep -iE "haptic|vibrat" | tail -4
+		echo "== vibrator"; dumpsys vibrator_manager 2>&1 | grep -iE "hal|capabilit|vibrator id|isVibrating" | head -6; dmesg | grep -iE "haptic|vibrat" | tail -4
+		if [ "'"${LOS_ACTIVE_HW:-0}"'" = 1 ]; then	# vibration and torch only on request (quiet tests)
+		echo "== vibrator buzz"; cmd vibrator_manager synced -f oneshot 150 2>&1 | head -2
 		echo "== torch"; cmd media.camera 2>/dev/null | head -1; for t in /sys/class/leds/torch-light0 /sys/class/leds/led:torch_0; do [ -e $t/brightness ] && { echo 50 > $t/brightness; sleep 1; echo "$t $(cat $t/brightness)"; echo 0 > $t/brightness; }; done
+		fi
 		echo "== failing services"; getprop | grep -E "init.svc.*\[(restarting|stopped)\]"
 		echo "== sysfs paths"; ls -l /sys/class/rfkill/ /sys/class/power_supply/ /sys/class/leds/ 2>&1 | grep -- "->"; ls -Z /sys/class/rfkill/*/state /sys/class/power_supply/*/type 2>&1
 	' > "logs/$name-hw.txt" 2>&1 || true
@@ -306,6 +325,7 @@ elif [ "$state" = pmos ]; then
 elif [ "$state" != recovery ]; then
 	say "no adb from LineageOS: waiting for its time limit (25 min) and TWRP"
 	waitfor recovery 1800 || { echo "neither LineageOS nor TWRP on adb: the phone needs a look" >&2; exit 3; }
+fi
 fi
 sleep 5
 say "TWRP: kernel log of the LineageOS boot, restoring boot and the boot menu"
