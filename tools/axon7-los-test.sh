@@ -20,7 +20,9 @@
 #
 # Usage: PMOS_HOST=user@phone [PMOS_SUDO_PASS=..] [PMOS_SSH_OPTS=..] \
 #        tools/axon7-los-test.sh OUTDIR NAME [IOS_KERNEL]
-#   OUTDIR: boot.img, system.img, vendor.img of the build (sparse is fine)
+#   OUTDIR: boot.img, system.img, vendor.img of the build (sparse is fine);
+#   or boot.img + super.img (LineageOS 24: super goes to "system", the
+#   start of los_metadata and los_data is zeroed)
 #   IOS_KERNEL: kernel for the iOS slot of the test shim image (default:
 #   the newest xnu/out-*/xnu-kernel/kernel.development.sweet); only the
 #   shim matters for this test, the image is replaced afterwards.
@@ -48,8 +50,12 @@ root() { printf '%s\n' "${PMOS_SUDO_PASS:-}" | ssh "${sshopt[@]}" "$host" "sudo 
 say() { echo "== $* ($(date +%T))"; }
 
 say "images"
-for f in boot system vendor; do [ -f "$src/$f.img" ] || { echo "no $src/$f.img" >&2; exit 1; }; done
-for f in system vendor; do
+# LineageOS 24 (lineageos-24-mainline): boot.img + super.img (dynamic
+# partitions, written into the GPT partition "system"), no vendor.img
+super=0; [ -f "$src/super.img" ] && [ ! -f "$src/system.img" ] && super=1
+imgs="system vendor"; [ $super = 1 ] && imgs=
+for f in boot $imgs; do [ -f "$src/$f.img" ] || { echo "no $src/$f.img" >&2; exit 1; }; done
+for f in $imgs; do
 	if [ "$(head -c 4 "$src/$f.img" | od -An -tx1 | tr -d ' ')" = 3aff26ed ]; then
 		simg2img "$src/$f.img" "$out/$f.raw"
 	else
@@ -145,7 +151,19 @@ putblk() {	# FILE: the last block of misc
 		{ echo "misc block does not read back" >&2; exit 1; }
 }
 say "TWRP: writing system, vendor, los_boot, test boot, boot menu"
-if [ "${LOS_SKIP_IMAGES:-0}" != 1 ]; then	# LOS_SKIP_IMAGES=1: system and vendor are current
+if [ "${LOS_SKIP_IMAGES:-0}" != 1 ] && [ $super = 1 ]; then
+	# data chunks of the sparse super image only, each read back (sha1)
+	d=$(dev system); [ -n "$d" ] || { echo "no partition system" >&2; exit 1; }
+	python3 -I tools/axon7-simg-put.py "$src/super.img" "$d" ||
+		{ echo "super.img -> $d failed" >&2; exit 1; }
+	echo "   super.img -> system ($d) written and verified"
+	# a new install: 22.2's (or an older 24's) metadata and FBE data are no use
+	for p in los_metadata:16 los_data:64; do
+		d=$(dev "${p%:*}"); [ -n "$d" ] || { echo "no partition ${p%:*}" >&2; exit 1; }
+		adb shell "dd if=/dev/zero of=$d bs=1048576 count=${p#*:} 2>/dev/null; sync"
+		echo "   ${p%:*} ($d): first ${p#*:} MiB zeroed"
+	done
+elif [ "${LOS_SKIP_IMAGES:-0}" != 1 ]; then	# LOS_SKIP_IMAGES=1: system and vendor are current
 	put "$out/system.raw" system
 	put "$out/vendor.raw" vendor
 fi
