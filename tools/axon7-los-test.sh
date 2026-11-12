@@ -278,14 +278,14 @@ if [ "$state" = device ] && [ "$(adb get-state 2>/dev/null || true)" != device ]
 fi
 if [ "$state" = device ]; then
 	say "collecting"
-	adb shell 'getprop' > "logs/$name-getprop.txt" 2>&1 || true
-	adb shell 'cat /proc/cmdline; uname -a; mount; df -h; ls -l /dev/block/by-name/; echo backlight $(cat /sys/class/leds/lcd-backlight/brightness /sys/class/leds/lcd-backlight/max_brightness); dumpsys power | grep -m3 -iE "mWakefulness=|mScreenOn|Display Power"' > "logs/$name-system.txt" 2>&1 || true
-	adb shell 'dmesg' > "logs/$name-dmesg.txt" 2>&1 || true
-	adb logcat -d -b all > "logs/$name-logcat.txt" 2>&1 || true
-	adb exec-out 'screencap -p' > "logs/$name-screen.png" 2>/dev/null || true
+	timeout 120 adb shell 'getprop' > "logs/$name-getprop.txt" 2>&1 || true
+	timeout 120 adb shell 'cat /proc/cmdline; uname -a; mount; df -h; ls -l /dev/block/by-name/; echo backlight $(cat /sys/class/leds/lcd-backlight/brightness /sys/class/leds/lcd-backlight/max_brightness); dumpsys power | grep -m3 -iE "mWakefulness=|mScreenOn|Display Power"' > "logs/$name-system.txt" 2>&1 || true
+	timeout 120 adb shell 'dmesg' > "logs/$name-dmesg.txt" 2>&1 || true
+	timeout 600 adb logcat -d -b all > "logs/$name-logcat.txt" 2>&1 || true
+	timeout 120 adb exec-out 'screencap -p' > "logs/$name-screen.png" 2>/dev/null || true
 	# hardware: modem (no SIM needed: baseband, IMEI, radio power, emergency-only
 	# registration, signal), GPS, camera, fingerprint, Wi-Fi, sensors, audio
-	adb shell '
+	timeout 300 adb shell '
 		echo "== modem subsystem"; for s in /sys/bus/msm_subsys/devices/*; do echo "$(cat $s/name 2>/dev/null) $(cat $s/state 2>/dev/null)"; done
 		echo "== radio props"; getprop | grep -E "gsm\.|ril\.|vendor.radio|persist.radio.multisim|baseband"
 		echo "== rild"; ps -A -o PID,NAME | grep -E "rild|qmuxd|pm-service|per_mgr|netmgrd|cnd|ims"
@@ -297,6 +297,7 @@ if [ "$state" = device ]; then
 		echo "== camera"; dumpsys media.camera | grep -iE "Number of camera|Camera [0-9]|facing|error|Device [0-9]" | head -15
 		echo "== fingerprint"; dumpsys fingerprint | head -15
 		echo "== wifi"; dumpsys wifi | grep -iE "Wi-Fi is|mWifiState|supplicant state|interface" | head -10; ip link | grep -E "wlan|p2p"
+		echo "== wifi scan"; cmd wifi set-wifi-enabled enabled 2>&1; sleep 10; cmd wifi status 2>&1 | head -4; cmd wifi start-scan 2>&1; sleep 10; cmd wifi list-scan-results 2>&1 | head -8
 		echo "== bluetooth"; dumpsys bluetooth_manager | grep -iE "enabled|state:|name:" | head -6
 		echo "== sensors"; dumpsys sensorservice | grep -E "^[0-9a-fx]+\)|Total [0-9]+ h/w sensors" | head -30
 		echo "== audio"; dumpsys media.audio_flinger | grep -iE "Output thread|Input thread|HAL|hw module|primary" | head -10
@@ -312,12 +313,12 @@ if [ "$state" = device ]; then
 		echo "== sysfs paths"; ls -l /sys/class/rfkill/ /sys/class/power_supply/ /sys/class/leds/ 2>&1 | grep -- "->"; ls -Z /sys/class/rfkill/*/state /sys/class/power_supply/*/type 2>&1
 	' > "logs/$name-hw.txt" 2>&1 || true
 	# camera: open the camera app for a preview (screenshot) and keep the HAL log of it
-	adb shell 'svc power stayon true; input keyevent KEYCODE_WAKEUP; sleep 2; wm dismiss-keyguard; sleep 1; logcat -b all -c; am start -W -n org.lineageos.aperture/.CameraLauncher 2>&1 || am start -W -a android.media.action.STILL_IMAGE_CAMERA 2>&1; sleep 12; dumpsys activity activities | grep -m3 -E "mResumedActivity|topResumedActivity"' > "logs/$name-camera-start.txt" 2>&1 || true
-	adb exec-out 'screencap -p' > "logs/$name-camera-preview.png" 2>/dev/null || true
-	adb shell 'dumpsys media.camera' > "logs/$name-camera-dump.txt" 2>&1 || true
-	adb shell 'logcat -d -b all -v threadtime | grep -vE "avc:  denied" | grep -iE "QCamera|CameraDevice|Camera3-|CameraService|mm-camera|aperture|CameraProvider|AndroidRuntime" | tail -200; input keyevent KEYCODE_HOME; svc power stayon false' > "logs/$name-camera-open.txt" 2>&1 || true
+	timeout 120 adb shell 'svc power stayon true; input keyevent KEYCODE_WAKEUP; sleep 2; wm dismiss-keyguard; sleep 1; logcat -b all -c; am start -W -n org.lineageos.aperture/.CameraLauncher 2>&1 || am start -W -a android.media.action.STILL_IMAGE_CAMERA 2>&1; sleep 12; dumpsys activity activities | grep -m3 -E "mResumedActivity|topResumedActivity"' > "logs/$name-camera-start.txt" 2>&1 || true
+	timeout 120 adb exec-out 'screencap -p' > "logs/$name-camera-preview.png" 2>/dev/null || true
+	timeout 120 adb shell 'dumpsys media.camera' > "logs/$name-camera-dump.txt" 2>&1 || true
+	timeout 600 adb shell 'logcat -d -b all -v threadtime | grep -vE "avc:  denied" | grep -iE "QCamera|CameraDevice|Camera3-|CameraService|mm-camera|aperture|CameraProvider|AndroidRuntime" | tail -200; input keyevent KEYCODE_HOME; svc power stayon false' > "logs/$name-camera-open.txt" 2>&1 || true
 	# camera: restart the daemon and the provider with HAL debug logging (root)
-	adb shell '
+	timeout 300 adb shell '
 		setprop persist.camera.hal.debug 4; setprop persist.camera.global.debug 4; setprop persist.camera.mct.debug 4
 		setprop persist.camera.sensor.debug 4; setprop persist.camera.eeprom.debug 4; setprop persist.camera.isp.debug 2
 		setprop persist.vendor.camera.hal.debug 4; setprop persist.vendor.camera.global.debug 4; setprop persist.vendor.camera.sensor.debug 4
