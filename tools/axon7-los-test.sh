@@ -312,6 +312,14 @@ if [ "$state" = device ]; then
 		echo "== failing services"; getprop | grep -E "init.svc.*\[(restarting|stopped)\]"
 		echo "== sysfs paths"; ls -l /sys/class/rfkill/ /sys/class/power_supply/ /sys/class/leds/ 2>&1 | grep -- "->"; ls -Z /sys/class/rfkill/*/state /sys/class/power_supply/*/type 2>&1
 	' > "logs/$name-hw.txt" 2>&1 || true
+	# audio, silent: mixer routes and a 3 s recording from the built-in mics
+	# (hw:0,0, level only; nothing is played)
+	timeout 120 adb shell '
+		echo "== audio routes"; dmesg | grep "axon7m-audio"
+		for c in "SLIMBUS_0_RX Audio Mixer MultiMedia2" "MultiMedia1 Mixer SLIMBUS_0_TX" "Bottom Speaker Switch" "Top Speaker Switch" "SDTO2 Source Selector" "SBO1L Source Selector" "Mic_1L input Selector" "Mic_1R input Selector"; do tinymix "$c" 2>&1 | head -1; done
+		echo "== mic capture"; rm -f /data/local/tmp/axon7-mic.wav; tinycap /data/local/tmp/axon7-mic.wav -D 0 -d 0 -c 2 -r 48000 -b 16 -T 3 2>&1 | tail -2; ls -l /data/local/tmp/axon7-mic.wav
+	' > "logs/$name-audio.txt" 2>&1 || true
+	timeout 60 adb pull /data/local/tmp/axon7-mic.wav "logs/$name-mic.wav" > /dev/null 2>&1 || true
 	# camera: open the camera app for a preview (screenshot) and keep the HAL log of it
 	timeout 120 adb shell 'svc power stayon true; input keyevent KEYCODE_WAKEUP; sleep 2; wm dismiss-keyguard; sleep 1; logcat -b all -c; am start -W -n org.lineageos.aperture/.CameraLauncher 2>&1 || am start -W -a android.media.action.STILL_IMAGE_CAMERA 2>&1; sleep 12; dumpsys activity activities | grep -m3 -E "mResumedActivity|topResumedActivity"' > "logs/$name-camera-start.txt" 2>&1 || true
 	timeout 120 adb exec-out 'screencap -p' > "logs/$name-camera-preview.png" 2>/dev/null || true
