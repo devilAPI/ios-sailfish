@@ -300,6 +300,7 @@ if [ "$state" = device ]; then
 		echo "== wifi scan"; cmd wifi set-wifi-enabled enabled 2>&1; sleep 10; cmd wifi status 2>&1 | head -4; cmd wifi start-scan 2>&1; sleep 10; cmd wifi list-scan-results 2>&1 | head -8
 		echo "== bluetooth"; dumpsys bluetooth_manager | grep -iE "enabled|state:|name:" | head -6
 		echo "== sensors"; dumpsys sensorservice | grep -E "^[0-9a-fx]+\)|Total [0-9]+ h/w sensors" | head -30
+		echo "== sensors kernel"; dmesg | grep -E "axon7m-sns-reg|axon7m-slpi-kick|smgr" | tail -8; for d in /sys/bus/iio/devices/iio:device*; do echo "$d $(cat $d/name)"; done; logcat -d -s axon7m-sensors | tail -8
 		echo "== audio"; dumpsys media.audio_flinger | grep -iE "Output thread|Input thread|HAL|hw module|primary" | head -10
 		echo "== nfc"; dumpsys nfc 2>&1 | grep -iE "mState|state=|enabled|mIsNfc|NfcService" | head -8
 		echo "== sound cards"; cat /proc/asound/cards; ls /dev/snd | head -40 | tr "\n" " "; echo
