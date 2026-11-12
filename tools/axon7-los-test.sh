@@ -330,6 +330,12 @@ if [ "$state" = device ]; then
 		timeout 30 adb push research/axon7/bin/aarec /data/local/tmp/ > /dev/null 2>&1
 		timeout 60 adb shell 'timeout 20 /data/local/tmp/aarec 2 2>&1' >> "logs/$name-audio.txt" 2>&1 || true
 	fi
+	# per-device mixer routes of the HAL (hardware/interfaces patch 0002) and the jack
+	timeout 120 adb shell '
+		echo "== HAL routes"; logcat -d -b all | grep -E "applyMixerRoute|mixerRoutes|populateConnectedDevicePort" | tail -12
+		for c in "QUAT_MI2S_RX Audio Mixer MultiMedia2" "SLIMBUS_0_RX Audio Mixer MultiMedia2" "Speaker Top Receiver Switch" "Top Speaker Switch" "Bottom Speaker Switch"; do tinymix "$c" 2>&1 | head -1; done
+		echo "== jack"; getevent -pl 2>/dev/null | grep -A6 "Headset Jack" | grep -E "name|SW_"; dumpsys audio | grep -iE "wired|headset|DevInputEvent" | head -8
+	' >> "logs/$name-audio.txt" 2>&1 || true
 	# camera: open the camera app for a preview (screenshot) and keep the HAL log of it
 	timeout 120 adb shell 'svc power stayon true; input keyevent KEYCODE_WAKEUP; sleep 2; wm dismiss-keyguard; sleep 1; logcat -b all -c; am start -W -n org.lineageos.aperture/.CameraLauncher 2>&1 || am start -W -a android.media.action.STILL_IMAGE_CAMERA 2>&1; sleep 12; dumpsys activity activities | grep -m3 -E "mResumedActivity|topResumedActivity"' > "logs/$name-camera-start.txt" 2>&1 || true
 	timeout 120 adb exec-out 'screencap -p' > "logs/$name-camera-preview.png" 2>/dev/null || true
