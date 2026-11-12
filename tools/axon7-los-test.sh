@@ -285,6 +285,8 @@ if [ "$state" = device ]; then
 	timeout 120 adb exec-out 'screencap -p' > "logs/$name-screen.png" 2>/dev/null || true
 	# hardware: modem (no SIM needed: baseband, IMEI, radio power, emergency-only
 	# registration, signal), GPS, camera, fingerprint, Wi-Fi, sensors, audio
+	# research/axon7/bin/sensread from lineageos-24-mainline/tools/sensread.c
+	[ -x research/axon7/bin/sensread ] && timeout 30 adb push research/axon7/bin/sensread /data/local/tmp/ > /dev/null 2>&1
 	timeout 300 adb shell '
 		echo "== modem subsystem"; for s in /sys/bus/msm_subsys/devices/*; do echo "$(cat $s/name 2>/dev/null) $(cat $s/state 2>/dev/null)"; done
 		echo "== radio props"; getprop | grep -E "gsm\.|ril\.|vendor.radio|persist.radio.multisim|baseband"
@@ -301,6 +303,7 @@ if [ "$state" = device ]; then
 		echo "== bluetooth"; dumpsys bluetooth_manager | grep -iE "enabled|state:|name:" | head -6
 		echo "== sensors"; dumpsys sensorservice | grep -E "^[0-9a-fx]+\)|Total [0-9]+ h/w sensors" | head -30
 		echo "== sensors kernel"; dmesg | grep -E "axon7m-sns-reg|axon7m-slpi-kick|smgr" | tail -8; for d in /sys/bus/iio/devices/iio:device*; do echo "$d $(cat $d/name)"; done; logcat -d -s axon7m-sensors | tail -8
+		echo "== sensor values"; [ -x /data/local/tmp/sensread ] && timeout 30 /data/local/tmp/sensread 2 2>&1
 		echo "== audio"; dumpsys media.audio_flinger | grep -iE "Output thread|Input thread|HAL|hw module|primary" | head -10
 		echo "== nfc"; dumpsys nfc 2>&1 | grep -iE "mState|state=|enabled|mIsNfc|NfcService" | head -8
 		echo "== sound cards"; cat /proc/asound/cards; ls /dev/snd | head -40 | tr "\n" " "; echo
