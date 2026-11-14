@@ -13,7 +13,7 @@ O=$1
 until [ "$(adb get-state 2>/dev/null)" = device ]; do sleep 3; done
 until [ "$(timeout 10 adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = 1 ]; do sleep 5; done
 sleep 75
-timeout 300 adb shell '
+timeout 400 adb shell LOUD=${LOUD:-0} '
 input keyevent KEYCODE_WAKEUP; svc power stayon true; sleep 1
 echo "== clocks"; for c in 0 2; do f=/sys/devices/system/cpu/cpu$c/cpufreq; echo "cpu$c $(cat $f/scaling_governor $f/scaling_cur_freq $f/scaling_max_freq | tr "\n" " ")"; done
 for g in /sys/class/devfreq/*gpu*; do echo "gpu $(cat $g/governor $g/cur_freq $g/max_freq | tr "\n" " ")"; done
@@ -46,6 +46,14 @@ echo "== gfxinfo"; dumpsys gfxinfo com.android.settings | grep -E "Total frames|
 echo "== ps"; ps -A -o PID,NAME | grep -E "surfaceflinger|settings|systemui|launcher|hwc"
 echo "== trace"; grep -v "^#" $T/trace | grep -E "msm_|dpu_|drm_vblank|tracing_mark_write: [BE]" | head -40000
 [ -n "$AT" ] && atrace --async_stop >/dev/null 2>&1
+echo "== codecs"; logcat -d -b all | grep -iE "MediaCodecList|Codec2Client|CCodec|Codec2InfoBuilder|IComponentStore|swcodec|C2Store" | grep -v avc | head -40
+if [ "${LOUD:-0}" = 1 ]; then
+echo "== alarm (speaker -> mic)"; logcat -c
+am start -a android.intent.action.SET_TIMER --ei android.intent.extra.alarm.LENGTH 1 --ez android.intent.extra.alarm.SKIP_UI true >/dev/null 2>&1
+sleep 7; timeout 6 tinycap /data/local/tmp/alarm.wav -D 0 -d 0 -c 1 -r 48000 -b 16 >/dev/null 2>&1
+dumpsys media.audio_flinger | grep -E "Standby:|Tracks" | head -6; am force-stop com.android.deskclock
+logcat -d -b all | grep -iE "Klaxon|NuPlayer|MediaCodec|CCodec|Codec2|decoder|applyMixerRoute|tinyalsa|pcm_|AHAL|StreamOut" | grep -v avc | head -60
+fi
 svc power stayon false
 ' > "$O" 2>&1
 echo "== done $(date +%T)" >> "$O"
