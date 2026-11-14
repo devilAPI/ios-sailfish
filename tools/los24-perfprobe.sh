@@ -46,6 +46,8 @@ echo "== gfxinfo"; dumpsys gfxinfo com.android.settings | grep -E "Total frames|
 echo "== ps"; ps -A -o PID,NAME | grep -E "surfaceflinger|settings|systemui|launcher|hwc"
 echo "== trace"; grep -v "^#" $T/trace | grep -E "msm_|dpu_|drm_vblank|tracing_mark_write: [BE]" | head -40000
 [ -n "$AT" ] && atrace --async_stop >/dev/null 2>&1
+echo "== modem"; dmesg | grep -E "axon7m-modem|remoteproc1" | tail -6; ls /vendor/bin/qrtr-lookup >/dev/null 2>&1 && /vendor/bin/qrtr-lookup | awk '$1==2||$1==16||$1==3||$1==11'
+echo "== gnss"; logcat -d -b all | grep -E "gnss-axon7m|GnssLocationProvider|GnssNative" | grep -v avc | tail -25; dumpsys location | grep -iE "gnss|gps provider|satellite|Last Known" | head -15
 echo "== codecs"; logcat -d -b all | grep -iE "MediaCodecList|Codec2Client|CCodec|Codec2InfoBuilder|IComponentStore|swcodec|C2Store" | grep -v avc | head -40
 if [ "${LOUD:-0}" = 1 ]; then
 echo "== alarm (speaker -> mic)"; logcat -c

@@ -38,6 +38,11 @@ for i in 1 2 3; do
 	sleep 20
 done
 grep -E '^[0-9a-f]{64}  ' logs/los24-build$N-check.txt | (cd $R && sha256sum -c) || { echo CHECKSUM MISMATCH; exit 3; }
+# disk: keep only this build and the delta base PREV (1.3 GB each; the
+# developer PC has little space); older builds' images and run dirs go
+for d in research/los24-build-*; do
+	n=${d##*-}; [ "$n" = "$N" ] || [ "$n" = "$P" ] || rm -rf "$d" "research/axon7/los24-m1a-$n"
+done
 [ -n "${PROBE:-}" ] && { "$PROBE" logs/los24-m1a-$N-perf.txt & }
 SSH_ASKPASS_REQUIRE=${SSH_ASKPASS:+force} PMOS_HOST=${PMOS_HOST:-user@172.16.42.1} \
 	PMOS_SSH_OPTS="${PMOS_SSH_OPTS:--o UserKnownHostsFile=/dev/null -o PubkeyAuthentication=no -o LogLevel=ERROR}" \
