@@ -90,6 +90,18 @@ if [ "${LOS_RESTORE:-0}" = 1 ]; then
 	LOS_RESTORE_ONLY=1
 fi
 resume=0
+# LOS_SHIM=keep with LineageOS running (adb device): go to TWRP first, the
+# saving below works from TWRP (2026-11-14: run 36 fell through to the
+# postmarketOS path and flashed nothing)
+if [ $keep = 1 ] && [ "${LOS_RESTORE_ONLY:-0}" != 1 ] && [ "$(adb get-state 2>/dev/null)" = device ]; then
+	say "LineageOS is running: rebooting to TWRP"
+	adb reboot recovery
+	for _ in $(seq 1 60); do
+		sleep 5
+		[ "$(adb get-state 2>/dev/null)" = recovery ] && break
+	done
+	[ "$(adb get-state 2>/dev/null)" = recovery ] || { echo "LineageOS did not reboot to TWRP" >&2; exit 3; }
+fi
 if [ "${LOS_RESTORE_ONLY:-0}" = 1 ]; then
 	resume=1	# restore only: nothing is saved again
 elif [ "$(adb get-state 2>/dev/null)" = recovery ] && [ -s "$out/boot-before.img" ] && [ -s "$out/misc-before.bin" ] && [ -s "$out/misc-blocks" ]; then
