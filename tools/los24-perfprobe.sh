@@ -20,6 +20,12 @@ for g in /sys/class/devfreq/*gpu*; do echo "gpu $(cat $g/governor $g/cur_freq $g
 echo "== backlight"; ls -l /sys/class/backlight/*/brightness /sys/class/backlight/*/bl_power
 settings put system screen_brightness_mode 0; settings put system screen_brightness 40; sleep 1; echo "setting 40: $(cat /sys/class/backlight/*/brightness)"
 settings put system screen_brightness 160; sleep 1; echo "setting 160: $(cat /sys/class/backlight/*/brightness)"
+for f in /sys/class/backlight/*/*; do [ -f $f ] && [ -r $f ] && case ${f##*/} in brightness|actual_brightness|max_brightness|scale|type|bl_power) echo "$f: $(cat $f)";; esac; done
+cmd display set-brightness 0.1; sleep 1; echo "cmd display 0.1: $(cat /sys/class/backlight/*/brightness)"
+cmd display set-brightness 0.9; sleep 1; echo "cmd display 0.9: $(cat /sys/class/backlight/*/brightness)"
+cmd display reset-brightness-configuration >/dev/null 2>&1
+dumpsys display | grep -iE "brightness|mBacklight|supportsBrightness" | head -20
+logcat -d -b all | grep -iE "backlight|brightness|lights" | grep -viE "Settings|InputReader" | tail -20
 echo "== composition"; dumpsys SurfaceFlinger | grep -iE "GLES:|HWC missed|Last HW vsync|activeMode="
 am start -W -a android.settings.SETTINGS >/dev/null; sleep 3
 T=/sys/kernel/tracing; [ -d $T/events ] || T=/sys/kernel/debug/tracing

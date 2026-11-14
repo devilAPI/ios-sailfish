@@ -61,6 +61,14 @@ if slices:
             print(f"  {pidname.get(p, p)[:28]:28} {n[:44]:44} {len(v):5}  {ms(v)}")
 if not jobs:
     sys.exit("no GPU jobs in the trace (msm tracepoints missing?)")
+if not any(j["el"] for j in jobs):
+    # a5xx (msm8996) retires without start/end timestamps: elapsed=0 mhz=0
+    by = {}
+    for j in jobs: by.setdefault(j["pid"], []).append(j["t"])
+    for p, ts in by.items():
+        print(f"  tid {p} {pidname.get(p, '?')[:30]:30} {len(ts)} GPU jobs retired, {(len(ts) - 1) / max(ts[-1] - ts[0], 1e-3):.1f}/s "
+              "(no GPU timestamps on this GPU: compare retire times with the release fences)")
+    sys.exit(0)
 span = max(jobs[-1]["t"] - jobs[0]["t"], 1e-3)
 print(f"{span:.2f} s, {len(jobs)} GPU jobs, GPU busy {sum(j['el'] for j in jobs) / 1e3 / span * 100:.0f} %, "
       f"clock {st.median([j['mhz'] for j in jobs])} MHz median")

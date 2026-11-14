@@ -43,10 +43,17 @@
 #   the MiB blocks that differ are written (then the whole partition is
 #   checked). LOS_SKIP_IMAGES=1: system and vendor are already the build's. A run that
 #   stopped in TWRP goes on there when started again with the same NAME.
+#   LOS_SHIM=keep: no test shim; the boot partition's own shim (the normal
+#   triple-boot one) starts LineageOS from the boot menu block. Needs no xnu
+#   kernel or firmware blobs, and no postmarketOS when the phone is already in
+#   TWRP (boot and misc are saved from there). As soon as LineageOS is on adb
+#   the saved boot menu is written back from it, so a crash or reset later
+#   ends in postmarketOS (no reset-to-TWRP of the test shim).
 set -euo pipefail
 src=$(realpath "$1") name=$2
 cd "$(dirname "$0")/.."
-kernel=${3:-$(ls -t xnu/out-*/xnu-kernel/kernel.development.sweet | head -1)}
+keep=0; [ "${LOS_SHIM:-}" = keep ] && keep=1
+[ $keep = 1 ] || kernel=${3:-$(ls -t xnu/out-*/xnu-kernel/kernel.development.sweet | head -1)}
 host=${PMOS_HOST:?set PMOS_HOST=user@phone}
 wait_s=${LOS_WAIT:-900}
 out=research/axon7/$name
@@ -90,6 +97,16 @@ elif [ "$(adb get-state 2>/dev/null)" = recovery ] && [ -s "$out/boot-before.img
 elif [ "${LOS_INSTALL:-0}" = 1 ] && [ "$(adb get-state 2>/dev/null)" = recovery ]; then
 	resume=1	# install from TWRP: boot and misc are not touched
 	echo 0 > "$out/misc-blocks"
+elif [ $keep = 1 ] && [ "$(adb get-state 2>/dev/null)" = recovery ]; then
+	say "saving boot and the boot-menu block from TWRP"
+	adb exec-out "dd if=$(adb shell "for b in /sys/class/block/*; do grep -q '^PARTNAME=boot\$' \$b/uevent 2>/dev/null && echo /dev/block/\${b##*/}; done" | tr -d '\r' | head -1) bs=1M 2>/dev/null" > "$out/boot-before.img"
+	python3 -I tools/axon7-dualboot.py extract "$out/boot-before.img" -o "$out/pmos.bundle" >/dev/null ||
+		{ echo "no postmarketOS bundle in the boot partition: refusing" >&2; exit 1; }
+	md=$(adb shell "for b in /sys/class/block/*; do grep -q '^PARTNAME=misc\$' \$b/uevent 2>/dev/null && echo \${b##*/}; done" | tr -d '\r' | head -1)
+	echo $(( $(adb shell cat /sys/class/block/$md/size | tr -d '\r') / 8 )) > "$out/misc-blocks"
+	adb exec-out "dd if=/dev/block/$md bs=4096 skip=$(( $(cat "$out/misc-blocks") - 1 )) count=1 2>/dev/null" > "$out/misc-before.bin"
+	[ "$(stat -c %s "$out/misc-before.bin")" = 4096 ] || { echo "could not read the misc block" >&2; exit 1; }
+	resume=1
 fi
 if [ $resume = 1 ]; then
 	say "resuming in TWRP with the saved boot and boot-menu block"
@@ -108,7 +125,9 @@ fi
 python3 -I -c 'import struct,sys; sys.stdout.buffer.write((b"AX7BOOT1"+struct.pack("<III",2,1,2^0xa5a5a5a5)).ljust(4096,b"\0"))' > "$out/misc-los.bin"
 
 install=${LOS_INSTALL:-0}
-if [ "$install" != 1 ] && [ "${LOS_RESTORE_ONLY:-0}" != 1 ]; then
+if [ $keep = 1 ]; then
+	cp "$out/boot-before.img" "$out/boot.img"	# the phone's own shim stays
+elif [ "$install" != 1 ] && [ "${LOS_RESTORE_ONLY:-0}" != 1 ]; then
 say "test shim image (LOS_TEST=1)"
 LOS_TEST=1 WDT_SECS=0 BUILD_ONLY=1 PMOS_BUNDLE="$out/pmos.bundle" \
 	tools/axon7-cycle.sh "$kernel" "$name" "$(cat tools/axon7-bootargs.txt)" >/dev/null
@@ -205,7 +224,7 @@ if [ "$install" = 1 ]; then
 	say "installed; the boot menu is as it was"
 	exit 0
 fi
-put "$out/boot.img" boot
+[ $keep = 1 ] || put "$out/boot.img" boot
 putblk "$out/misc-los.bin"
 adb reboot
 
@@ -228,6 +247,14 @@ if [ "$state" = device ]; then
 	# a panic right after boot (hard reset, the test shim's TWRP mark is lost)
 	# ends in postmarketOS: never wait for adb without a limit
 	timeout 120 adb wait-for-device || true
+	if [ $keep = 1 ]; then	# normal shim: put the boot menu back now, a reset must not loop into LineageOS
+		timeout 60 adb wait-for-device || true; sleep 3	# adbd restarts after adb root
+		md=$(timeout 20 adb shell "for b in /sys/class/block/*; do grep -q '^PARTNAME=misc\$' \$b/uevent 2>/dev/null && echo /dev/block/\${b##*/}; done" | tr -d '\r' | head -1) || true
+		[ -n "$md" ] && timeout 30 adb push "$out/misc-before.bin" /data/local/tmp/misc-before.bin >/dev/null &&
+		timeout 30 adb shell "dd if=/data/local/tmp/misc-before.bin of=$md bs=4096 seek=$(( misc_blocks - 1 )) conv=notrunc 2>/dev/null; sync" &&
+		[ "$(timeout 30 adb exec-out "dd if=$md bs=4096 skip=$(( misc_blocks - 1 )) count=1 2>/dev/null" | sha1sum)" = "$(sha1sum < "$out/misc-before.bin")" ] &&
+			echo "   boot menu restored from LineageOS" || echo "   could not restore the boot menu from LineageOS (TWRP does it later)" >&2
+	fi
 	for i in $(seq 1 60); do [ "$(timeout 20 adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = 1 ] && break; [ "$(adb get-state 2>/dev/null || true)" = device ] || break; sleep 5; done
 	settle=${LOS_SETTLE:-300} t0=$SECONDS
 	while [ $((SECONDS - t0)) -lt "$settle" ]; do

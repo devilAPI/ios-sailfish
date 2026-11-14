@@ -14,7 +14,8 @@
 # Run from the ios checkout: tools/los24-run.sh 29 28
 set -u
 N=$1 P=$2
-: "${PMOS_SUDO_PASS:?set PMOS_SUDO_PASS (Nura sudo password) in the environment}"
+: "${PMOS_SUDO_PASS:=}"; [ -n "$PMOS_SUDO_PASS" ] || [ "${LOS_SHIM:-}" = keep ] ||
+	{ echo "set PMOS_SUDO_PASS (Nura sudo password), or LOS_SHIM=keep with the phone in TWRP" >&2; exit 1; }
 cd "$(dirname "$0")/.."
 O=(-o ServerAliveInterval=30 -o ServerAliveCountMax=40 -o ConnectTimeout=30)
 while :; do timeout 90 ssh "${O[@]}" root@compiler 'su - build -c "tmux has-session -t los24build" 2>/dev/null'; r=$?; [ $r = 1 ] && break; sleep 30; done
