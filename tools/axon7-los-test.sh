@@ -60,6 +60,9 @@ out=research/axon7/$name
 mkdir -p "$out" logs
 read -r -a extra <<< "${PMOS_SSH_OPTS:-}"
 sshopt=(-o ConnectTimeout=10 -o ServerAliveInterval=10 -o StrictHostKeyChecking=accept-new "${extra[@]}")
+# no SSH_ASKPASS: never ask for a password on the terminal (unattended runs hung
+# there, 2026-11-15: 172.16.42.1 was the second phone's Nura, not the main phone)
+[ -n "${SSH_ASKPASS:-}" ] || sshopt=(-o BatchMode=yes "${sshopt[@]}")
 on() { ssh "${sshopt[@]}" "$host" "$@" </dev/null; }
 root() { printf '%s\n' "${PMOS_SUDO_PASS:-}" | ssh "${sshopt[@]}" "$host" "sudo -S -p '' sh -c '$1'"; }
 say() { echo "== $* ($(date +%T))"; }
