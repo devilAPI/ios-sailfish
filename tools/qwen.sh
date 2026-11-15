@@ -1,7 +1,7 @@
 #!/bin/bash
 # qwen.sh "TASK" [FILE...]: one small text task for the local model (Ollama,
-# qwen3.5-9b-iq4xs-24k on the developer PC). Files are appended to the prompt
-# as fenced blocks. The model has a 24k-token context: input is capped at
+# qwen3.5-9b-iq4xs-28k on the developer PC). Files are appended to the prompt
+# as fenced blocks. The model has a 28k-token context: input is capped at
 # QWEN_MAX_CHARS (default 60000 characters, about 15k tokens) so the answer
 # still fits. Output: the model's answer on stdout. Use it for reviews of
 # small diffs, condensing pre-filtered logs, drafting short texts; check what
@@ -9,7 +9,7 @@
 set -euo pipefail
 task=$1; shift
 max=${QWEN_MAX_CHARS:-60000}
-model=${QWEN_MODEL:-qwen3.5-9b-iq4xs-24k}
+model=${QWEN_MODEL:-qwen3.5-9b-iq4xs-28k}
 python3 -I - "$task" "$max" "$model" "$@" <<'EOF'
 import json, sys, urllib.request
 task, maxc, model, files = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4:]
