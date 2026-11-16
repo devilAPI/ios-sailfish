@@ -21,11 +21,16 @@ O=(-o ServerAliveInterval=30 -o ServerAliveCountMax=40 -o ConnectTimeout=30)
 while :; do timeout 90 ssh "${O[@]}" root@compiler 'su - build -c "tmux has-session -t los24build" 2>/dev/null'; r=$?; [ $r = 1 ] && break; sleep 30; done
 S=/srv/los24/lineage-24.0/out/target/product/axon7m
 for i in 1 2 3 4 5; do
-	timeout 120 ssh "${O[@]}" root@compiler "tr '\r' '\n' < /srv/los24/logs/build-latest.log | grep -E '^FAILED|#### ' | head -4 | cut -c1-300; cd $S && sha256sum boot.img super.img" > logs/los24-build$N-check.txt 2>&1 && break
+	timeout 120 ssh "${O[@]}" root@compiler "tr '\r' '\n' < /srv/los24/logs/build-latest.log | grep -aE '^FAILED|#### |^AXON7_GPU=' | head -5 | cut -c1-300; cd $S && sha256sum boot.img super.img" > logs/los24-build$N-check.txt 2>&1 && break
 	sleep 20
 done
 cat logs/los24-build$N-check.txt
 grep -q "completed successfully" logs/los24-build$N-check.txt || { echo BUILD NOT OK; exit 2; }
+# the CI release build (lineageos-24.yml, ci/build-release.sh) uses the same
+# server tree without the developer adb key: such images must never reach the
+# phone unattended (adb would need an on-screen confirm after the wipe)
+grep -q "AXON7_ADB_KEYS=test-keys" logs/los24-build$N-check.txt ||
+	{ echo "BUILD HAS NO TEST ADB KEY (release flavour?): not installing"; exit 5; }
 # a failed chain leaves the previous build's log and images: refuse a rerun of PREV
 new_super=$(grep -E ' super.img$' logs/los24-build$N-check.txt | cut -d' ' -f1)
 old_super=$(grep -E ' super.img$' logs/los24-build$P-check.txt 2>/dev/null | cut -d' ' -f1)
